@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    container_name: btc-mean-reversion-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - .:/app  # Opcional: útil para desarrollo si quieres mapear cambios en caliente
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
