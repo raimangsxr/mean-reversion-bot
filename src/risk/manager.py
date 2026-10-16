@@ -21,6 +21,8 @@ class TradeRiskPlan:
     required_margin: float
     risk_budget: float
     estimated_risk: float
+    risk_utilization: float
+    limiting_factor: str
 
 
 class RiskManager:
@@ -91,11 +93,13 @@ class RiskManager:
         usable_margin = free_margin * (1.0 - self.cash_buffer_pct)
         max_notional_by_margin = usable_margin * leverage
 
-        notional = min(
-            risk_sized_notional,
-            max_position_notional,
-            max_notional_by_margin,
-        )
+        caps = {
+            "risk": risk_sized_notional,
+            "position_pct": max_position_notional,
+            "margin": max_notional_by_margin,
+        }
+        limiting_factor = min(caps, key=caps.get)
+        notional = caps[limiting_factor]
         if notional <= 0:
             raise ValueError("El sizing produce un notional no válido.")
 
@@ -103,6 +107,7 @@ class RiskManager:
         position_fraction = notional / account_equity
         required_margin = notional / leverage
         estimated_risk = notional * stop_fraction
+        risk_utilization = estimated_risk / risk_budget if risk_budget > 0 else 0.0
 
         if side == "long":
             stop_price = expected_entry_price - stop_distance
@@ -131,4 +136,6 @@ class RiskManager:
             required_margin=required_margin,
             risk_budget=risk_budget,
             estimated_risk=estimated_risk,
+            risk_utilization=risk_utilization,
+            limiting_factor=limiting_factor,
         )

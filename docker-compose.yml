@@ -1,7 +1,7 @@
 services:
   trading-bot:
     build: .
-    container_name: btc-mean-reversion-bot
+    container_name: mean-reversion-bot-v9
     restart: unless-stopped
     env_file:
       - .env

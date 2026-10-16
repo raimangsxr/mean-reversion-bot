@@ -18,10 +18,15 @@ class FakeExchange:
     def price_to_precision(self, symbol, price):
         return f"{float(price):.2f}"
 
+    def amount_to_precision(self, symbol, amount):
+        return f"{float(amount):.6f}"
+
     def create_order(self, symbol, order_type, side, amount, price, params):
         client_id = params.get("clientOrderId", "")
         if client_id.startswith("zsl_"):
             order_id = "sl-1"
+        elif client_id.startswith("zptp_"):
+            order_id = "ptp-1"
         elif client_id.startswith("ztp_"):
             order_id = "tp-1"
         else:
@@ -308,7 +313,7 @@ def test_partial_pending_fill_cancels_remainder_and_installs_protection(tmp_path
     assert tp["params"]["postOnly"] is True
 
 
-def test_submit_v8c_separates_limit_and_fallback_references(tmp_path):
+def test_v9_separates_limit_and_fallback_references(tmp_path):
     engine = make_engine(tmp_path)
     engine.get_position_state = lambda symbol: {
         "known": True,
@@ -329,7 +334,7 @@ def test_submit_v8c_separates_limit_and_fallback_references(tmp_path):
         stop_distance=2.0,
         risk_reward_ratio=1.5,
         use_take_profit=True,
-        signal_timestamp="signal-v8c",
+        signal_timestamp="signal-v9",
     )
 
     state = result["state"]
@@ -339,7 +344,7 @@ def test_submit_v8c_separates_limit_and_fallback_references(tmp_path):
     assert state.entry_order_kind == "limit"
 
 
-def test_marketable_v8c_limit_enters_wait_only_instead_of_forcing_post_only(tmp_path):
+def test_v9_marketable_limit_enters_wait_only_instead_of_forcing_post_only(tmp_path):
     engine = make_engine(tmp_path)
     engine.get_position_state = lambda symbol: {
         "known": True,
@@ -415,3 +420,79 @@ def test_post_only_marketable_rejection_falls_back_to_wait_only(tmp_path):
     assert state.entry_order_kind == "wait"
     assert state.entry_order_id is None
     assert state.entry_client_order_id is None
+
+
+def test_move_stop_to_break_even_creates_new_stop_before_cancel(tmp_path):
+    engine = make_engine(tmp_path)
+    old = {
+        "id": "sl-old", "status": "open", "filled": 0.0,
+        "symbol": "BTC/USDT:USDT", "type": "stop_market", "side": "sell",
+        "amount": 1.0, "price": None, "clientOrderId": "zsl_old", "params": {},
+    }
+    engine.exchange.orders["sl-old"] = dict(old)
+    engine.state_store.save(BotState(
+        status="protected", symbol="BTC/USDT:USDT", side="long",
+        entry_price=100.0, amount=1.0, initial_stop_price=98.0, stop_price=98.0,
+        stop_order_id="sl-old", stop_client_order_id="zsl_old",
+        protection_mode="stop_only",
+    ))
+    engine._fetch_open_position = lambda symbol: PositionSnapshot(
+        side="long", contracts=1.0, entry_price=100.0, notional=100.0
+    )
+
+    state = engine.move_stop_to_break_even("BTC/USDT:USDT")
+
+    assert state.break_even_armed is True
+    assert state.stop_price == 100.0
+    assert state.stop_order_id == "sl-1"
+    assert engine.exchange.cancel_calls[0][0] == "sl-old"
+
+
+def test_partial_tp_splits_exit_quantity_and_persists_order(tmp_path, monkeypatch):
+    import src.execution.engine as engine_module
+
+    monkeypatch.setattr(engine_module, "PARTIAL_TP_TRIGGER_R", 0.75)
+    monkeypatch.setattr(engine_module, "PARTIAL_TP_FRACTION", 0.50)
+    monkeypatch.setattr(engine_module, "PARTIAL_TP_MOVE_STOP_TO_BE", True)
+    engine = make_engine(tmp_path)
+
+    result = engine._protect_filled_entry(
+        symbol="BTC/USDT:USDT", side="long", filled=1.0, fill_price=100.0,
+        entry_order_id="entry-1", entry_client_order_id="zentry_test",
+        entry_order_kind="limit", stop_distance=2.0, risk_reward_ratio=1.5,
+        use_take_profit=True,
+    )
+
+    state = result["state"]
+    assert state.partial_take_profit_order_id == "ptp-1"
+    assert state.partial_take_profit_amount == 0.5
+    assert state.partial_take_profit_price == 101.5
+    partial = next(o for o in engine.exchange.created if o["id"] == "ptp-1")
+    final = next(o for o in engine.exchange.created if o["id"] == "tp-1")
+    assert partial["amount"] == 0.5
+    assert final["amount"] == 0.5
+    assert final["price"] == 103.0
+
+
+def test_completed_partial_tp_is_detected_for_break_even(tmp_path, monkeypatch):
+    import src.execution.engine as engine_module
+
+    monkeypatch.setattr(engine_module, "PARTIAL_TP_TRIGGER_R", 0.75)
+    monkeypatch.setattr(engine_module, "PARTIAL_TP_FRACTION", 0.50)
+    engine = make_engine(tmp_path)
+    result = engine._protect_filled_entry(
+        symbol="BTC/USDT:USDT", side="long", filled=1.0, fill_price=100.0,
+        entry_order_id="entry-1", entry_client_order_id="zentry_test",
+        entry_order_kind="limit", stop_distance=2.0, risk_reward_ratio=1.5,
+        use_take_profit=True,
+    )
+    engine.exchange.orders["ptp-1"]["status"] = "closed"
+    engine.exchange.orders["ptp-1"]["filled"] = 0.5
+    engine._fetch_open_position = lambda symbol: PositionSnapshot(
+        side="long", contracts=0.5, entry_price=100.0, notional=50.0
+    )
+
+    state_result = engine.get_position_state("BTC/USDT:USDT")
+
+    assert state_result["known"] is True
+    assert engine.state_store.load().partial_take_profit_filled is True

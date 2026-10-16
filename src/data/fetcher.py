@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
+import json
+import re
 from typing import Optional
 
-import ccxt
+try:
+    import ccxt  # type: ignore
+except ImportError:  # pragma: no cover
+    ccxt = None
 import pandas as pd
 
 OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
-_PUBLIC_FUTURES_EXCHANGE: Optional[ccxt.binance] = None
+_PUBLIC_FUTURES_EXCHANGE = None
 
 
-def _make_public_futures_exchange() -> ccxt.binance:
+def _make_public_futures_exchange():
     """Cliente público Binance USD-M persistente y reutilizable."""
     global _PUBLIC_FUTURES_EXCHANGE
 
+    if ccxt is None:
+        raise RuntimeError("CCXT no esta instalado. Ejecuta pip install -r requirements.txt")
     if _PUBLIC_FUTURES_EXCHANGE is None:
         exchange = ccxt.binance(
             {
@@ -43,8 +51,17 @@ def _to_dataframe(ohlcv: list[list[float]]) -> pd.DataFrame:
 
 
 def timeframe_to_timedelta(timeframe: str) -> pd.Timedelta:
-    seconds = ccxt.Exchange.parse_timeframe(timeframe)
-    return pd.Timedelta(seconds=seconds)
+    if ccxt is not None:
+        seconds = ccxt.Exchange.parse_timeframe(timeframe)
+        return pd.Timedelta(seconds=seconds)
+    # Fallback minimo para tests/utilidades sin CCXT instalado.
+    try:
+        delta = pd.Timedelta(timeframe)
+    except ValueError as exc:
+        raise ValueError(f"Timeframe no compatible: {timeframe}") from exc
+    if delta <= pd.Timedelta(0):
+        raise ValueError("El timeframe debe ser positivo")
+    return delta
 
 
 def keep_closed_candles(
@@ -86,8 +103,15 @@ def fetch_binance_history(
     start: str,
     end: str,
     limit: int = 1000,
+    *,
+    allow_empty: bool = False,
 ) -> pd.DataFrame:
-    """Descarga OHLCV Futures paginado entre start (incl.) y end (excl.)."""
+    """Descarga OHLCV Futures paginado entre start (incl.) y end (excl.).
+
+    ``allow_empty`` se usa únicamente por la cache incremental al sondear un
+    prefijo que puede estar antes del listing del contrato. Los callers normales
+    siguen fallando si Binance no devuelve ninguna vela.
+    """
     exchange = _make_public_futures_exchange()
     timeframe_ms = exchange.parse_timeframe(timeframe) * 1000
 
@@ -124,6 +148,156 @@ def fetch_binance_history(
 
     df = _to_dataframe(rows)
     if df.empty:
+        if allow_empty:
+            return pd.DataFrame(
+                columns=OHLCV_COLUMNS[1:],
+                index=pd.DatetimeIndex([], tz="UTC", name="timestamp"),
+            )
         raise RuntimeError("Binance Futures no devolvió velas para el periodo solicitado.")
 
     return keep_closed_candles(df, timeframe)
+
+
+
+def _history_cache_slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
+
+
+def _history_cache_meta_path(cache_path: Path) -> Path:
+    return cache_path.with_suffix(cache_path.suffix + ".meta.json")
+
+
+def _load_history_cache_meta(cache_path: Path) -> dict:
+    meta_path = _history_cache_meta_path(cache_path)
+    if not meta_path.exists():
+        return {}
+    try:
+        value = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _save_history_cache_meta(cache_path: Path, meta: dict) -> None:
+    meta_path = _history_cache_meta_path(cache_path)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
+
+
+def _empty_prefix_is_known(meta: dict, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
+    try:
+        known_start = pd.Timestamp(meta["empty_prefix_start"])
+        known_end = pd.Timestamp(meta["empty_prefix_end"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    known_start = known_start.tz_localize("UTC") if known_start.tzinfo is None else known_start.tz_convert("UTC")
+    known_end = known_end.tz_localize("UTC") if known_end.tzinfo is None else known_end.tz_convert("UTC")
+    return known_start <= start_ts and known_end >= end_ts
+
+
+def fetch_binance_history_cached(
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    cache_dir: str,
+    limit: int = 1000,
+) -> pd.DataFrame:
+    """Incremental OHLCV cache for research history.
+
+    The first call downloads the requested history. Later calls only request
+    closed candles missing at the head/tail, avoiding six full-history downloads
+    on every V9 run (BTC/ETH/SOL x 1h/4h).
+    """
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    start_ts = start_ts.tz_localize("UTC") if start_ts.tzinfo is None else start_ts.tz_convert("UTC")
+    end_ts = end_ts.tz_localize("UTC") if end_ts.tzinfo is None else end_ts.tz_convert("UTC")
+    delta = timeframe_to_timedelta(timeframe)
+    cache_path = Path(cache_dir) / f"{_history_cache_slug(symbol)}_{_history_cache_slug(timeframe)}.csv"
+
+    cache = pd.DataFrame(columns=OHLCV_COLUMNS[1:], index=pd.DatetimeIndex([], tz="UTC", name="timestamp"))
+    if cache_path.exists():
+        try:
+            raw = pd.read_csv(cache_path)
+            if not raw.empty and "timestamp" in raw.columns:
+                raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
+                cache = (
+                    raw.dropna(subset=["timestamp"])
+                    .drop_duplicates(subset="timestamp", keep="last")
+                    .sort_values("timestamp")
+                    .set_index("timestamp")
+                )
+        except pd.errors.EmptyDataError:
+            pass
+
+    meta = _load_history_cache_meta(cache_path)
+    meta_changed = False
+    cache_changed = False
+    pieces = [cache] if not cache.empty else []
+
+    if cache.empty:
+        # En la primera descarga Binance suele saltar directamente al primer
+        # candle listado aunque BACKTEST_START sea anterior al listing.
+        downloaded = fetch_binance_history(
+            symbol, timeframe, start_ts.isoformat(), end_ts.isoformat(), limit=limit
+        )
+        pieces.append(downloaded)
+        cache_changed = True
+    else:
+        first = cache.index.min()
+        last = cache.index.max()
+        if first > start_ts:
+            prefix_end = min(first, end_ts)
+            if start_ts < prefix_end and not _empty_prefix_is_known(meta, start_ts, prefix_end):
+                # Un contrato puede no existir todavía en BACKTEST_START (p.ej.
+                # SOL USD-M en 2020). Ese prefijo vacío es válido y no debe
+                # abortar el backtest. Se memoriza para no pedirlo en cada run.
+                prefix = fetch_binance_history(
+                    symbol,
+                    timeframe,
+                    start_ts.isoformat(),
+                    prefix_end.isoformat(),
+                    limit=limit,
+                    allow_empty=True,
+                )
+                if prefix.empty:
+                    meta["empty_prefix_start"] = start_ts.isoformat()
+                    meta["empty_prefix_end"] = prefix_end.isoformat()
+                    meta_changed = True
+                else:
+                    pieces.append(prefix)
+                    cache_changed = True
+                    meta.pop("empty_prefix_start", None)
+                    meta.pop("empty_prefix_end", None)
+                    meta_changed = True
+
+        # next_start candle must itself be closed by end_ts. This avoids calling
+        # Binance every run just for the currently-forming candle.
+        next_start = last + delta
+        if next_start + delta <= end_ts:
+            tail = fetch_binance_history(
+                symbol, timeframe, next_start.isoformat(), end_ts.isoformat(), limit=limit
+            )
+            pieces.append(tail)
+            cache_changed = True
+
+    if cache_changed:
+        cache = pd.concat(pieces).sort_index()
+        cache = cache[~cache.index.duplicated(keep="last")]
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        out = cache.reset_index().rename(columns={"index": "timestamp"})
+        out.to_csv(cache_path, index=False)
+    elif pieces:
+        cache = pieces[0]
+
+    if meta_changed:
+        _save_history_cache_meta(cache_path, meta)
+
+    sliced = cache.loc[(cache.index >= start_ts) & (cache.index < end_ts)]
+    sliced = keep_closed_candles(sliced, timeframe, now=end_ts)
+    if sliced.empty:
+        raise RuntimeError(
+            f"Cache/history vacio para {symbol} {timeframe} entre {start} y {end}."
+        )
+    return sliced

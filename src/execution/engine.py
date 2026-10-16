@@ -8,7 +8,18 @@ import time
 import uuid
 from typing import Any, Optional
 
-import ccxt
+try:
+    import ccxt  # type: ignore
+except ImportError:  # pragma: no cover
+    class _MissingNetworkError(Exception):
+        pass
+    class _MissingOrderNotFound(Exception):
+        pass
+    class _MissingCCXT:
+        NetworkError = _MissingNetworkError
+        OrderNotFound = _MissingOrderNotFound
+        binance = None
+    ccxt = _MissingCCXT()
 
 from config.settings import (
     BINANCE_API_KEY,
@@ -16,6 +27,9 @@ from config.settings import (
     EXECUTION_JOURNAL_FILE,
     LEVERAGE,
     MARGIN_MODE,
+    PARTIAL_TP_FRACTION,
+    PARTIAL_TP_MOVE_STOP_TO_BE,
+    PARTIAL_TP_TRIGGER_R,
     STATE_FILE,
     TAKE_PROFIT_ORDER_MODE,
     TRIGGER_PRICE_TYPE,
@@ -52,15 +66,15 @@ class BotState:
     side: Optional[str] = None
     entry_order_id: Optional[str] = None
     entry_client_order_id: Optional[str] = None
-    # market para la entrada entrada/fallback V8 final; limit para la entrada pasiva V8.
+    # market para la entrada/fallback V9; limit para la entrada pasiva V9.
     entry_order_kind: Optional[str] = None
     entry_time: Optional[str] = None
     entry_price: Optional[float] = None
     amount: Optional[float] = None
 
-    # V8: entrada LIMIT persistente. Estos campos solo viven mientras status
+    # V9: entrada LIMIT persistente. Estos campos solo viven mientras status
     # esta en entry_pending*. Al proteger el fill se limpian.
-    # V8 final usa dos referencias distintas:
+    # La entrada V9 usa dos referencias distintas:
     # - pending_reference_price: close de la vela de senal; ancla la LIMIT -offset.
     # - pending_fallback_reference_price: precio observado en t=0; ancla el cap no-chase.
     pending_reference_price: Optional[float] = None
@@ -73,12 +87,19 @@ class BotState:
     pending_fallback_cap_bps: Optional[float] = None
     pending_fallback_max_lateness_seconds: Optional[int] = None
     pending_journal_context: Optional[dict[str, Any]] = None
+    initial_stop_price: Optional[float] = None
     stop_price: Optional[float] = None
+    break_even_armed: bool = False
     take_profit_price: Optional[float] = None
     stop_order_id: Optional[str] = None
     stop_client_order_id: Optional[str] = None
     take_profit_order_id: Optional[str] = None
     take_profit_client_order_id: Optional[str] = None
+    partial_take_profit_order_id: Optional[str] = None
+    partial_take_profit_client_order_id: Optional[str] = None
+    partial_take_profit_price: Optional[float] = None
+    partial_take_profit_amount: Optional[float] = None
+    partial_take_profit_filled: bool = False
     # "limit" para TP maker; "trigger" para el TP market legado.
     take_profit_order_kind: Optional[str] = None
     take_profit_last_filled: float = 0.0
@@ -145,6 +166,9 @@ class BinanceExecutionEngine:
             raise ValueError(
                 "take_profit_order_mode debe ser maker_limit o trigger_market."
             )
+
+        if getattr(ccxt, "binance", None) is None:
+            raise ExecutionError("CCXT no esta instalado. Ejecuta pip install -r requirements.txt")
 
         self.leverage = leverage
         self.margin_mode = margin_mode
@@ -696,7 +720,7 @@ class BinanceExecutionEngine:
                 or (order.get("info") or {}).get("clientOrderId")
                 or ""
             )
-            if client_id.startswith("ztp_"):
+            if client_id.startswith(("ztp_", "zptp_")):
                 result.append(order)
         return result
 
@@ -759,6 +783,8 @@ class BinanceExecutionEngine:
                 regular_ids.add(str(state.take_profit_order_id))
             else:
                 trigger_ids.add(str(state.take_profit_order_id))
+        if state.partial_take_profit_order_id:
+            regular_ids.add(str(state.partial_take_profit_order_id))
 
         try:
             for order in self._fetch_bot_trigger_orders(symbol):
@@ -988,7 +1014,7 @@ class BinanceExecutionEngine:
         use_take_profit: bool,
         journal_context: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Instala SL/TP a partir del fill real, comun a MARKET y LIMIT V8."""
+        """Instala SL/TP a partir del fill real, comun a MARKET y LIMIT V9."""
         if side == "long":
             stop_price = fill_price - stop_distance
             take_profit_price = (
@@ -1018,16 +1044,25 @@ class BinanceExecutionEngine:
 
         state = self.state_store.load()
         state.status = "entry_filled"
+        state.symbol = symbol
+        state.side = side
         state.entry_order_id = entry_order_id
         state.entry_client_order_id = entry_client_order_id
         state.entry_order_kind = entry_order_kind
         state.entry_time = self._now_iso()
         state.entry_price = fill_price
         state.amount = filled
+        state.initial_stop_price = stop_price
         state.stop_price = stop_price
+        state.break_even_armed = False
         state.take_profit_price = take_profit_price
         state.take_profit_order_kind = None
         state.take_profit_last_filled = 0.0
+        state.partial_take_profit_order_id = None
+        state.partial_take_profit_client_order_id = None
+        state.partial_take_profit_price = None
+        state.partial_take_profit_amount = None
+        state.partial_take_profit_filled = False
         state.protection_mode = (
             "stop_and_tp_maker"
             if use_take_profit and self.take_profit_order_mode == "maker_limit"
@@ -1042,6 +1077,7 @@ class BinanceExecutionEngine:
         stop_client_id = self._client_id("zsl")
         stop_order: Optional[dict[str, Any]] = None
         tp_order: Optional[dict[str, Any]] = None
+        partial_tp_order: Optional[dict[str, Any]] = None
 
         try:
             stop_order = self._create_trigger_order(
@@ -1060,12 +1096,49 @@ class BinanceExecutionEngine:
             self.state_store.save(state)
 
             if use_take_profit and take_profit_price is not None:
+                final_tp_amount = filled
+                if PARTIAL_TP_TRIGGER_R > 0:
+                    if self.take_profit_order_mode != "maker_limit":
+                        raise ProtectionError("Partial TP requiere TAKE_PROFIT_ORDER_MODE=maker_limit.")
+                    raw_partial_amount = filled * PARTIAL_TP_FRACTION
+                    partial_amount = float(
+                        self.exchange.amount_to_precision(symbol, raw_partial_amount)
+                    )
+                    final_tp_amount = float(
+                        self.exchange.amount_to_precision(symbol, filled - partial_amount)
+                    )
+                    if partial_amount <= 0 or final_tp_amount <= 0:
+                        raise ProtectionError("Sizing parcial produce cantidades no validas.")
+                    partial_price = (
+                        fill_price + stop_distance * PARTIAL_TP_TRIGGER_R
+                        if side == "long"
+                        else fill_price - stop_distance * PARTIAL_TP_TRIGGER_R
+                    )
+                    partial_client_id = self._client_id("zptp")
+                    partial_tp_order = self._create_take_profit_limit(
+                        symbol=symbol,
+                        side=exit_side,
+                        amount=partial_amount,
+                        price=partial_price,
+                        client_order_id=partial_client_id,
+                    )
+                    state.partial_take_profit_order_id = (
+                        str(partial_tp_order.get("id"))
+                        if partial_tp_order.get("id") is not None
+                        else None
+                    )
+                    state.partial_take_profit_client_order_id = partial_client_id
+                    state.partial_take_profit_price = float(
+                        self.exchange.price_to_precision(symbol, partial_price)
+                    )
+                    state.partial_take_profit_amount = partial_amount
+
                 tp_client_id = self._client_id("ztp")
                 if self.take_profit_order_mode == "maker_limit":
                     tp_order = self._create_take_profit_limit(
                         symbol=symbol,
                         side=exit_side,
-                        amount=filled,
+                        amount=final_tp_amount,
                         price=take_profit_price,
                         client_order_id=tp_client_id,
                     )
@@ -1075,7 +1148,7 @@ class BinanceExecutionEngine:
                         symbol=symbol,
                         order_type="take_profit_market",
                         side=exit_side,
-                        amount=filled,
+                        amount=final_tp_amount,
                         trigger_price=take_profit_price,
                         client_order_id=tp_client_id,
                     )
@@ -1109,6 +1182,12 @@ class BinanceExecutionEngine:
             self.state_store.save(state)
             recovery = self._recover_owned_position(symbol, state.note)
             raise ProtectionError(recovery.get("reason", state.note))
+        if use_take_profit and PARTIAL_TP_TRIGGER_R > 0 and not state.partial_take_profit_order_id:
+            state.status = "critical"
+            state.note = "Binance no devolvio ID del take profit parcial."
+            self.state_store.save(state)
+            recovery = self._recover_owned_position(symbol, state.note)
+            raise ProtectionError(recovery.get("reason", state.note))
 
         state.status = "protected"
         if use_take_profit:
@@ -1138,6 +1217,10 @@ class BinanceExecutionEngine:
             take_profit_price=take_profit_price,
             take_profit_order_kind=state.take_profit_order_kind,
             take_profit_post_only=(state.take_profit_order_kind == "limit"),
+            partial_take_profit_order_id=state.partial_take_profit_order_id,
+            partial_take_profit_price=state.partial_take_profit_price,
+            partial_take_profit_amount=state.partial_take_profit_amount,
+            partial_move_stop_to_be=PARTIAL_TP_MOVE_STOP_TO_BE,
             protection_mode=state.protection_mode,
             context=journal_context or {},
         )
@@ -1145,6 +1228,7 @@ class BinanceExecutionEngine:
         return {
             "stop": stop_order,
             "take_profit": tp_order,
+            "partial_take_profit": partial_tp_order,
             "state": state,
         }
 
@@ -1308,16 +1392,16 @@ class BinanceExecutionEngine:
         fallback_reference_price: Optional[float] = None,
         journal_context: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Crea la entrada V8 final persistente.
+        """Crea la entrada V9 persistente.
 
-        V8 final usa dos referencias distintas:
+        V9 usa dos referencias distintas:
         - reference_price: close de la vela de senal; ancla la LIMIT +/- offset.
         - fallback_reference_price: precio observado al iniciar (t=0); ancla el
           cap no-chase del fallback.
 
         Si la LIMIT ya seria marketable en t=0, no se fuerza una orden postOnly
         que Binance rechazaria. Se persiste un estado wait-only y, al expirar,
-        se evalua el mismo fallback condicional que en el research V8 final.
+        se evalua el mismo fallback condicional que en el research V9.
         """
         if side not in {"long", "short"}:
             raise ValueError("side debe ser long o short.")
@@ -1360,7 +1444,7 @@ class BinanceExecutionEngine:
         if limit_price <= 0:
             raise ExecutionError("Precio LIMIT de entrada invalido tras precision.")
 
-        # Misma condicion conservadora que V8 final: la orden solo se considera
+        # Condicion conservadora V9: la orden solo se considera
         # postOnly si puede descansar desde t=0. Si ya seria marketable, se
         # espera sin orden hasta la decision de fallback.
         resting_possible = (
@@ -1403,7 +1487,7 @@ class BinanceExecutionEngine:
 
         if not resting_possible:
             state.note = (
-                "V8 final: LIMIT no puede descansar postOnly en t=0; "
+                "V9: LIMIT no puede descansar postOnly en t=0; "
                 "esperando decision de fallback."
             )
             self.state_store.save(state)
@@ -1423,7 +1507,7 @@ class BinanceExecutionEngine:
             )
             return {"order": None, "state": state}
 
-        state.note = "Enviando entrada LIMIT postOnly V8 final."
+        state.note = "Enviando entrada LIMIT postOnly V9."
         self.state_store.save(state)
 
         submit_time = self._now_iso()
@@ -1462,7 +1546,7 @@ class BinanceExecutionEngine:
                 or "could not be executed as maker" in error_text
             )
             if post_only_rejection:
-                # El research V8 final no fuerza un fill taker si la LIMIT no puede
+                # El research V9 no fuerza un fill taker si la LIMIT no puede
                 # descansar en t=0. Conservamos la senal en wait-only y
                 # dejamos que el fallback/no-chase decida al expirar.
                 state.status = "entry_pending"
@@ -1470,7 +1554,7 @@ class BinanceExecutionEngine:
                 state.entry_client_order_id = None
                 state.entry_order_kind = "wait"
                 state.note = (
-                    "V8 final: Binance rechazo postOnly por marketable; "
+                    "V9: Binance rechazo postOnly por marketable; "
                     "esperando decision de fallback."
                 )
                 self.state_store.save(state)
@@ -1517,7 +1601,7 @@ class BinanceExecutionEngine:
 
         state.entry_order_id = order_id
         state.status = "entry_pending"
-        state.note = "Entrada LIMIT postOnly V8 final pendiente de fill."
+        state.note = "Entrada LIMIT postOnly V9 pendiente de fill."
         self.state_store.save(state)
         self._journal(
             "entry_pending_created",
@@ -1539,7 +1623,7 @@ class BinanceExecutionEngine:
         return {"order": order, "state": state}
 
     def resolve_pending_entry(self, symbol: str) -> dict[str, Any]:
-        """Expira la entrada V8 final y aplica fallback MARKET solo dentro del cap."""
+        """Expira la entrada V9 y aplica fallback MARKET solo dentro del cap."""
         state = self.state_store.load()
         if state.status not in self.ENTRY_PENDING_STATUSES:
             return {"action": "not_pending", "state": state}
@@ -1551,7 +1635,7 @@ class BinanceExecutionEngine:
                     "action": "unknown_position",
                     "state": state,
                     "reason": (
-                        "Aparecio una posicion mientras V8 final estaba en wait-only; "
+                        "Aparecio una posicion mientras V9 estaba en wait-only; "
                         "no puede atribuirse a una orden del bot."
                     ),
                 }
@@ -1641,7 +1725,7 @@ class BinanceExecutionEngine:
 
         if lateness > max_lateness:
             flat = self._set_flat(
-                f"Entrada V8 final cancelada: fallback demasiado tarde ({lateness:.0f}s)."
+                f"Entrada V9 cancelada: fallback demasiado tarde ({lateness:.0f}s)."
             )
             self._journal(
                 "entry_cancelled_late",
@@ -1658,7 +1742,7 @@ class BinanceExecutionEngine:
         assert current_price is not None and cap_price is not None
         if not within_cap:
             flat = self._set_flat(
-                "Entrada V8 final cancelada: precio fuera del cap no-chase."
+                "Entrada V9 cancelada: precio fuera del cap no-chase."
             )
             self._journal(
                 "entry_cancelled_no_chase",
@@ -1690,7 +1774,7 @@ class BinanceExecutionEngine:
             context=context,
         )
         self._set_flat(
-            "Entrada V8 final expirada; ejecutando fallback MARKET dentro del cap."
+            "Entrada V9 expirada; ejecutando fallback MARKET dentro del cap."
         )
         fallback_context = {
             **context,
@@ -1730,7 +1814,7 @@ class BinanceExecutionEngine:
             }
 
         if state.status in self.ENTRY_PENDING_STATUSES:
-            # V8 final wait-only: la LIMIT no pudo descansar postOnly en t=0, por
+            # V9 wait-only: la LIMIT no pudo descansar postOnly en t=0, por
             # lo que no existe una orden del bot que pueda atribuir una posicion.
             if state.entry_order_kind == "wait":
                 if position is not None:
@@ -1740,7 +1824,7 @@ class BinanceExecutionEngine:
                         "state": state,
                         "position": position,
                         "reason": (
-                            "Aparecio una posicion durante un wait-only V8 final; "
+                            "Aparecio una posicion durante un wait-only V9; "
                             "no se puede atribuir al bot de forma segura."
                         ),
                     }
@@ -1963,6 +2047,60 @@ class BinanceExecutionEngine:
                 f"Stop no abierto mientras la posicion sigue viva: SL={stop_status}",
             )
 
+        # TP parcial V9: mientras siga abierto forma parte del plan reduceOnly.
+        # Solo consideramos completado el parcial cuando Binance confirma que se
+        # ha ejecutado toda la cantidad prevista; entonces main puede mover el
+        # stop a break-even de forma segura.
+        if state.partial_take_profit_order_id and not state.partial_take_profit_filled:
+            try:
+                partial_order = self._fetch_regular_order(
+                    symbol, state.partial_take_profit_order_id
+                )
+                partial_status = str(partial_order.get("status") or "unknown").lower()
+                partial_filled = float(partial_order.get("filled") or 0.0)
+                expected_partial = float(state.partial_take_profit_amount or 0.0)
+                completed = (
+                    partial_status in {"closed", "filled"}
+                    or (expected_partial > 0 and partial_filled >= expected_partial * 0.999999)
+                )
+                if completed:
+                    state.partial_take_profit_filled = True
+                    self.state_store.save(state)
+                    self._journal(
+                        "partial_take_profit_filled",
+                        symbol=symbol,
+                        side=state.side,
+                        order_id=state.partial_take_profit_order_id,
+                        filled=partial_filled,
+                        expected_amount=expected_partial,
+                        price=state.partial_take_profit_price,
+                        trade_details=self._fetch_trade_details(
+                            symbol, state.partial_take_profit_order_id
+                        ),
+                        **self._order_fee_payload(partial_order),
+                    )
+                elif partial_status in {"canceled", "cancelled", "rejected", "expired"}:
+                    return self._recover_owned_position(
+                        symbol,
+                        f"TP parcial dejo de estar activo antes de completarse: {partial_status}",
+                    )
+                elif partial_status not in {"open", "new", "partially_filled", "partial"}:
+                    return {
+                        "known": False,
+                        "has_position": True,
+                        "state": state,
+                        "position": position,
+                        "reason": f"Estado no reconocido de TP parcial: {partial_status}",
+                    }
+            except Exception as exc:
+                return {
+                    "known": False,
+                    "has_position": True,
+                    "state": state,
+                    "position": position,
+                    "reason": f"No se pudo verificar el TP parcial: {exc}",
+                }
+
         tp_status: Optional[str] = None
         if state.take_profit_order_id:
             try:
@@ -2020,6 +2158,83 @@ class BinanceExecutionEngine:
             "stop_status": stop_status,
             "take_profit_status": tp_status,
         }
+
+    def move_stop_to_break_even(self, symbol: str, reason: str = "break_even") -> BotState:
+        """Mueve el SL al precio de entrada sin dejar la posicion desprotegida.
+
+        Se crea primero el nuevo STOP_MARKET reduceOnly y solo despues se intenta
+        cancelar el stop anterior. Si la cancelacion queda ambigua, pueden coexistir
+        temporalmente dos stops reduceOnly; esto es mas seguro que abrir una ventana
+        sin proteccion. La reconciliacion flat limpiara cualquier remanente.
+        """
+        state = self.state_store.load()
+        position = self._fetch_open_position(symbol)
+        if position is None:
+            return self._set_flat("Break-even solicitado sin posicion abierta.")
+        if state.status != "protected" or state.side != position.side:
+            raise ExecutionError(
+                "No es seguro mover el stop: estado local/posicion no coinciden."
+            )
+        if state.break_even_armed:
+            return state
+        if not state.stop_order_id or not state.entry_price:
+            raise ExecutionError("No existe stop/entry valido para mover a break-even.")
+
+        old_stop_id = str(state.stop_order_id)
+        new_stop_price = float(self.exchange.price_to_precision(symbol, state.entry_price))
+        if new_stop_price <= 0:
+            raise ExecutionError("Precio break-even invalido tras precision.")
+        exit_side = "sell" if position.side == "long" else "buy"
+        amount = float(self.exchange.amount_to_precision(symbol, position.contracts))
+        if amount <= 0:
+            raise ExecutionError("Cantidad invalida al mover stop a break-even.")
+
+        client_id = self._client_id("zsl")
+        try:
+            new_order = self._create_trigger_order(
+                symbol=symbol,
+                order_type="stop_market",
+                side=exit_side,
+                amount=amount,
+                trigger_price=new_stop_price,
+                client_order_id=client_id,
+            )
+        except Exception as exc:
+            raise ExecutionError(f"No se pudo crear stop break-even: {exc}") from exc
+
+        new_id = str(new_order.get("id")) if new_order.get("id") is not None else None
+        if not new_id:
+            raise ExecutionError("Binance creo stop break-even sin order id.")
+
+        state.stop_order_id = new_id
+        state.stop_client_order_id = client_id
+        state.stop_price = new_stop_price
+        state.break_even_armed = True
+        state.note = f"Stop movido a break-even: {reason}"
+        self.state_store.save(state)
+        self._journal(
+            "stop_moved_break_even",
+            symbol=symbol,
+            side=position.side,
+            old_stop_order_id=old_stop_id,
+            new_stop_order_id=new_id,
+            stop_price=new_stop_price,
+            reason=reason,
+        )
+
+        try:
+            self._cancel_order_safely(symbol, old_stop_id, trigger=True)
+        except Exception as exc:
+            # El nuevo stop ya esta persistido y activo. No revertimos a una
+            # configuracion menos segura; dejamos telemetria para reconciliar.
+            self._journal(
+                "old_stop_cancel_failed_after_break_even",
+                symbol=symbol,
+                old_stop_order_id=old_stop_id,
+                new_stop_order_id=new_id,
+                error=str(exc),
+            )
+        return state
 
     def close_position_market(self, symbol: str, reason: str) -> BotState:
         """Cierra la posicion del bot en mercado y elimina SL/TP restantes."""
