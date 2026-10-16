@@ -1,83 +1,310 @@
-import time
-import pandas as pd
-from src.data.fetcher import fetch_binance_klines
-from src.strategy.mean_reversion import MeanReversionStrategy
-from src.execution.engine import BinanceExecutionEngine  # Ajusta la ruta si es necesario
-from config.settings import (
-    SYMBOL, TIMEFRAME, LOOKBACK_WINDOW, Z_THRESHOLD, 
-    TREND_WINDOW, ATR_WINDOW, ATR_MULTIPLIER, RISK_REWARD_RATIO, INITIAL_CAPITAL
-)
+from __future__ import annotations
 
-def main():
-    print(f"🚀 Iniciando Bot de Reversión a la Media en {SYMBOL} ({TIMEFRAME})...")
-    
-    # Inicializar estrategia y motor de ejecución
+from datetime import datetime, timezone
+import math
+import time
+
+from config.settings import (
+    ATR_MULTIPLIER,
+    ATR_WINDOW,
+    CASH_BUFFER_PCT,
+    ENABLE_LONGS,
+    ENABLE_SHORTS,
+    ENTRY_MODE,
+    EXIT_MODE,
+    LEVERAGE,
+    LOOKBACK_WINDOW,
+    MAX_HOLDING_BARS,
+    MAX_POSITION_PCT,
+    MEAN_EXIT_Z,
+    POLL_INTERVAL_SECONDS,
+    RISK_PER_TRADE,
+    RISK_REWARD_RATIO,
+    REGIME_EMA_WINDOW,
+    REGIME_MODE,
+    REGIME_SLOPE_LOOKBACK,
+    REGIME_TIMEFRAME,
+    SIGNAL_MAX_AGE_SECONDS,
+    SYMBOL,
+    TIMEFRAME,
+    TAKE_PROFIT_ORDER_MODE,
+    TREND_WINDOW,
+    Z_THRESHOLD,
+    validate_settings,
+)
+from src.data.fetcher import fetch_binance_klines, timeframe_to_timedelta
+from src.execution.engine import BinanceExecutionEngine, ExecutionError
+from src.risk.manager import RiskManager
+from src.strategy.mean_reversion import MeanReversionStrategy
+
+
+def _signal_side(latest) -> str | None:
+    if ENABLE_LONGS and bool(latest.get("entry_long", False)):
+        return "long"
+    if ENABLE_SHORTS and bool(latest.get("entry_short", False)):
+        return "short"
+    return None
+
+
+def _mean_exit_for_side(latest, side: str) -> bool:
+    if side == "long":
+        return bool(latest.get("exit_long_mean", False))
+    if side == "short":
+        return bool(latest.get("exit_short_mean", False))
+    return False
+
+
+def _timeout_reached(entry_time_iso: str | None) -> bool:
+    if not entry_time_iso:
+        return False
+    try:
+        entry_time = datetime.fromisoformat(entry_time_iso)
+        if entry_time.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+
+    max_seconds = (
+        timeframe_to_timedelta(TIMEFRAME).total_seconds() * MAX_HOLDING_BARS
+    )
+    elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds()
+    return elapsed >= max_seconds
+
+
+def main() -> None:
+    validate_settings()
+
+    print(
+        f"Z-score bot | Binance USD-M Futures | {SYMBOL} {TIMEFRAME} | "
+        f"One-way | {LEVERAGE}x | entry={ENTRY_MODE} | exit={EXIT_MODE} | "
+        f"longs={ENABLE_LONGS} | shorts={ENABLE_SHORTS} | regime={REGIME_MODE} | "
+        f"tp_mode={TAKE_PROFIT_ORDER_MODE}"
+    )
+
     strategy = MeanReversionStrategy(
-        window=LOOKBACK_WINDOW, 
+        window=LOOKBACK_WINDOW,
         z_threshold=Z_THRESHOLD,
         trend_window=TREND_WINDOW,
         atr_window=ATR_WINDOW,
+        entry_mode=ENTRY_MODE,
+        mean_exit_z=MEAN_EXIT_Z,
+        regime_mode=REGIME_MODE,
+        signal_timeframe=TIMEFRAME,
+        regime_timeframe=REGIME_TIMEFRAME,
+        regime_ema_window=REGIME_EMA_WINDOW,
+        regime_slope_lookback=REGIME_SLOPE_LOOKBACK,
+    )
+    risk = RiskManager(
+        risk_per_trade=RISK_PER_TRADE,
+        max_position_pct=MAX_POSITION_PCT,
         atr_multiplier=ATR_MULTIPLIER,
-        risk_reward_ratio=RISK_REWARD_RATIO
+        risk_reward_ratio=RISK_REWARD_RATIO,
+        cash_buffer_pct=CASH_BUFFER_PCT,
     )
     engine = BinanceExecutionEngine()
+    engine.configure_account(SYMBOL)
+
+    data_limit = max(LOOKBACK_WINDOW, TREND_WINDOW, ATR_WINDOW) + 100
+    regime_data_limit = (
+        REGIME_EMA_WINDOW + REGIME_SLOPE_LOOKBACK + 100
+    )
 
     try:
         while True:
-            # 1. Obtener datos recientes
-            df = fetch_binance_klines(symbol=SYMBOL, timeframe=TIMEFRAME, limit=300)
-            df_signals = strategy.calculate_signals(df)
-            latest = df_signals.iloc[-1]
-            
-            print(f"[{latest.name}] Close: {latest['close']:.2f} | Z-Score: {latest['z_score']:.2f} | Trend SMA: {latest['sma_trend']:.2f}")
+            try:
+                df = fetch_binance_klines(
+                    symbol=SYMBOL,
+                    timeframe=TIMEFRAME,
+                    limit=data_limit,
+                    closed_only=True,
+                )
+                if df.empty:
+                    raise RuntimeError("No hay velas cerradas disponibles.")
 
-            # 2. Comprobar si ya tenemos una posición abierta para no solapar
-            position = engine.get_current_position(SYMBOL)
-            
-            if not position['has_position']:
-                # 3. Evaluar señales de entrada (asumiendo que entry_long / entry_short son booleanos)
-                # Si tu estrategia devuelve un campo 'signal' numérico (1, -1, 0), adaptamos la condición:
-                is_long = latest.get('entry_long', False) or latest.get('signal', 0) == 1
-                is_short = latest.get('entry_short', False) or latest.get('signal', 0) == -1
-
-                if is_long or is_short:
-                    side = 'buy' if is_long else 'sell'
-                    entry_price = latest['close']
-                    atr_value = latest['atr']
-                    
-                    # Calcular niveles de SL y TP
-                    if side == 'buy':
-                        sl_price = entry_price - (atr_value * ATR_MULTIPLIER)
-                        tp_price = entry_price + ((entry_price - sl_price) * RISK_REWARD_RATIO)
-                    else:
-                        sl_price = entry_price + (atr_value * ATR_MULTIPLIER)
-                        tp_price = entry_price - ((sl_price - entry_price) * RISK_REWARD_RATIO)
-
-                    # Calcular tamaño de posición (ej. arriesgando un porcentaje fijo o capital base de prueba)
-                    # Para pruebas en Testnet, podemos usar un monto fijo en USDT o derivado del balance libre
-                    usdt_balance = engine.get_balance('USDT')
-                    allocation_usdt = min(usdt_balance * 0.1, 100) # Usar 10% del balance o máximo 100 USDT para test
-                    amount = round(allocation_usdt / entry_price, 5)
-
-                    print(f"🎯 Señal detectada [{side.upper()}]. Precio: {entry_price} | SL: {sl_price:.2f} | TP: {tp_price:.2f}")
-                    
-                    # Ejecutar en Testnet
-                    engine.execute_trade_with_sl_tp(
+                regime_df = None
+                if REGIME_MODE != "1h_sma200":
+                    regime_df = fetch_binance_klines(
                         symbol=SYMBOL,
-                        side=side,
-                        amount=amount,
-                        entry_price=entry_price,
-                        sl_price=sl_price,
-                        tp_price=tp_price
+                        timeframe=REGIME_TIMEFRAME,
+                        limit=regime_data_limit,
+                        closed_only=True,
                     )
-            else:
-                print("🛡️ Posición ya activa en el mercado. Monitorizando...")
+                    if regime_df.empty:
+                        raise RuntimeError(
+                            f"No hay velas {REGIME_TIMEFRAME} cerradas para el regimen."
+                        )
 
-            # Esperar antes de la siguiente comprobación (en velas de 1h lo ideal es chequear cada pocos minutos o al cierre de vela)
-            time.sleep(60)
-            
+                signals = strategy.calculate_signals(df, regime_df=regime_df)
+                latest = signals.iloc[-1]
+                signal_timestamp = latest.name.isoformat()
+
+                z = float(latest.get("z_score", math.nan))
+                local_sma = float(latest.get("local_sma", math.nan))
+                htf_close = float(latest.get("htf_close", math.nan))
+                htf_ma = float(latest.get("htf_ma", math.nan))
+                htf_slope_up = bool(latest.get("htf_slope_up", False))
+                print(
+                    f"[{latest.name}] close={latest['close']:.2f} | "
+                    f"z={z:.3f} | regime={REGIME_MODE} | "
+                    f"local_sma={local_sma:.2f} | "
+                    f"htf_close={htf_close:.2f} | htf_ema={htf_ma:.2f} | "
+                    f"htf_slope_up={htf_slope_up}"
+                )
+
+                # V7: reconciliamos SIEMPRE la posicion/protecciones en cada poll,
+                # incluso si esta vela ya fue procesada. Asi SL/TP y partial fills no
+                # esperan hasta la siguiente vela para ser detectados.
+                position_state = engine.get_position_state(SYMBOL)
+                if not position_state.get("known"):
+                    print(
+                        "Estado de posicion no verificable; se reintentara: "
+                        f"{position_state.get('reason', 'sin detalle')}"
+                    )
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                if engine.was_signal_processed(signal_timestamp):
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                # -----------------------------------------------------------------
+                # Gestion de posicion abierta
+                # -----------------------------------------------------------------
+                if position_state.get("has_position"):
+                    position = position_state["position"]
+                    state = position_state["state"]
+
+                    if EXIT_MODE == "z_reversion":
+                        mean_exit = _mean_exit_for_side(latest, position.side)
+                        timeout_exit = _timeout_reached(state.entry_time)
+
+                        if mean_exit or timeout_exit:
+                            # Persistimos primero para impedir una segunda decision
+                            # sobre la misma vela si el cierre queda ambiguo.
+                            engine.mark_signal_processed(signal_timestamp)
+                            reason = (
+                                f"mean_reversion z={z:.3f}"
+                                if mean_exit
+                                else f"timeout {MAX_HOLDING_BARS} velas"
+                            )
+                            print(
+                                f"Cerrando {position.side.upper()} en mercado: {reason}"
+                            )
+                            engine.close_position_market(SYMBOL, reason)
+                            print("Posicion cerrada y ordenes de proteccion limpiadas.")
+                            time.sleep(POLL_INTERVAL_SECONDS)
+                            continue
+
+                    engine.mark_signal_processed(signal_timestamp)
+                    print(
+                        f"Posicion {position.side.upper()} activa | "
+                        f"contracts={position.contracts} | "
+                        f"entry={position.entry_price:.2f} | "
+                        f"SL={state.stop_price} | TP={state.take_profit_price}"
+                    )
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                # -----------------------------------------------------------------
+                # Cuenta flat: solo aqui consideramos una nueva entrada.
+                # -----------------------------------------------------------------
+                candle_close_time = latest.name + timeframe_to_timedelta(TIMEFRAME)
+                now = datetime.now(timezone.utc)
+                age_seconds = (now - candle_close_time.to_pydatetime()).total_seconds()
+                if age_seconds > SIGNAL_MAX_AGE_SECONDS:
+                    engine.mark_signal_processed(signal_timestamp)
+                    print(
+                        f"Entrada descartada: la vela cerro hace {age_seconds:.0f}s "
+                        f"(maximo {SIGNAL_MAX_AGE_SECONDS}s)."
+                    )
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                side = _signal_side(latest)
+                if side is None:
+                    engine.mark_signal_processed(signal_timestamp)
+                    print("Sin senal de entrada en esta vela.")
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                atr = float(latest["atr"])
+                if not math.isfinite(atr) or atr <= 0:
+                    raise RuntimeError(f"ATR invalido: {atr}")
+
+                market_price = engine.get_market_price(SYMBOL)
+                account = engine.get_account_snapshot("USDT")
+                plan = risk.build_plan(
+                    side=side,
+                    account_equity=account.equity,
+                    free_margin=account.free_margin,
+                    expected_entry_price=market_price,
+                    atr=atr,
+                    leverage=LEVERAGE,
+                )
+                amount = engine.normalize_amount(
+                    SYMBOL,
+                    base_amount=plan.base_amount,
+                    price=market_price,
+                )
+
+                engine.mark_signal_processed(signal_timestamp)
+
+                if EXIT_MODE == "fixed_rr":
+                    exit_description = f"TP esperado~{plan.take_profit_price:.2f}"
+                else:
+                    exit_description = (
+                        f"exit z={MEAN_EXIT_Z:.2f} / timeout={MAX_HOLDING_BARS} velas"
+                    )
+
+                print(
+                    f"{side.upper()} | market~{market_price:.2f} | "
+                    f"notional~{plan.notional:.2f} USDT | "
+                    f"margin~{plan.required_margin:.2f} | "
+                    f"risk~{plan.estimated_risk:.2f} USDT | "
+                    f"SL esperado~{plan.stop_price:.2f} | {exit_description}"
+                )
+
+                result = engine.execute_trade_with_protection(
+                    symbol=SYMBOL,
+                    side=side,
+                    amount=amount,
+                    stop_distance=plan.stop_distance,
+                    risk_reward_ratio=RISK_REWARD_RATIO,
+                    use_take_profit=(EXIT_MODE == "fixed_rr"),
+                    journal_context={
+                        "signal_time": signal_timestamp,
+                        "signal_close": float(latest["close"]),
+                        "signal_z": z,
+                        "atr": atr,
+                        "regime_mode": REGIME_MODE,
+                        "local_sma": local_sma,
+                        "htf_close": htf_close,
+                        "htf_ema": htf_ma,
+                        "expected_entry_price": market_price,
+                        "risk_reward_ratio": RISK_REWARD_RATIO,
+                        "estimated_notional": plan.notional,
+                        "estimated_risk": plan.estimated_risk,
+                    },
+                )
+                final_state = result["state"]
+                print(
+                    f"{side.upper()} abierto | fill={final_state.entry_price:.2f} | "
+                    f"SL={final_state.stop_price:.2f} | "
+                    f"TP={final_state.take_profit_price} | "
+                    f"tp_kind={final_state.take_profit_order_kind} | "
+                    f"proteccion={final_state.protection_mode}"
+                )
+
+            except ExecutionError as exc:
+                print(f"Ejecucion bloqueada por seguridad: {exc}")
+            except Exception as exc:
+                print(f"Error en ciclo principal: {type(exc).__name__}: {exc}")
+
+            time.sleep(POLL_INTERVAL_SECONDS)
+
     except KeyboardInterrupt:
-        print("\n🛑 Bot detenido por el usuario.")
+        print("\nBot detenido por el usuario.")
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,22 @@
+{
+  "status": "flat",
+  "symbol": null,
+  "side": null,
+  "entry_order_id": null,
+  "entry_client_order_id": null,
+  "entry_time": null,
+  "entry_price": null,
+  "amount": null,
+  "stop_price": null,
+  "take_profit_price": null,
+  "stop_order_id": null,
+  "stop_client_order_id": null,
+  "take_profit_order_id": null,
+  "take_profit_client_order_id": null,
+  "take_profit_order_kind": null,
+  "take_profit_last_filled": 0.0,
+  "protection_mode": null,
+  "last_signal_timestamp": "2026-10-15T23:00:00+00:00",
+  "updated_at": "2026-10-16T00:43:09.994840+00:00",
+  "note": "Binance confirma que no hay posicion abierta."
+}
