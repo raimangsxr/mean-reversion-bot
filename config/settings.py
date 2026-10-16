@@ -106,6 +106,11 @@ BACKTEST_V6_REGIME_MODE = os.getenv(
 # Ejecucion / persistencia
 # -----------------------------------------------------------------------------
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+
+# Ante errores transitorios de red/API reintentamos antes que el poll normal.
+# Es importante porque la ventana de entrada es de solo 300 segundos.
+ERROR_RETRY_SECONDS = int(os.getenv("ERROR_RETRY_SECONDS", "10"))
+
 SIGNAL_MAX_AGE_SECONDS = int(os.getenv("SIGNAL_MAX_AGE_SECONDS", "300"))
 STATE_FILE = os.getenv("STATE_FILE", "state/bot_state.json")
 

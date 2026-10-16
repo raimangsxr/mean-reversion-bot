@@ -30,6 +30,7 @@ from config.settings import (
     TAKE_PROFIT_ORDER_MODE,
     TREND_WINDOW,
     Z_THRESHOLD,
+    ERROR_RETRY_SECONDS,
     validate_settings,
 )
 from src.data.fetcher import fetch_binance_klines, timeframe_to_timedelta
@@ -157,10 +158,11 @@ def main() -> None:
                 position_state = engine.get_position_state(SYMBOL)
                 if not position_state.get("known"):
                     print(
-                        "Estado de posicion no verificable; se reintentara: "
+                        "Estado de posicion no verificable; "
+                        f"reintento en {ERROR_RETRY_SECONDS}s: "
                         f"{position_state.get('reason', 'sin detalle')}"
                     )
-                    time.sleep(POLL_INTERVAL_SECONDS)
+                    time.sleep(ERROR_RETRY_SECONDS)
                     continue
 
                 if engine.was_signal_processed(signal_timestamp):
@@ -208,22 +210,32 @@ def main() -> None:
                 # -----------------------------------------------------------------
                 # Cuenta flat: solo aqui consideramos una nueva entrada.
                 # -----------------------------------------------------------------
-                candle_close_time = latest.name + timeframe_to_timedelta(TIMEFRAME)
-                now = datetime.now(timezone.utc)
-                age_seconds = (now - candle_close_time.to_pydatetime()).total_seconds()
-                if age_seconds > SIGNAL_MAX_AGE_SECONDS:
-                    engine.mark_signal_processed(signal_timestamp)
-                    print(
-                        f"Entrada descartada: la vela cerro hace {age_seconds:.0f}s "
-                        f"(maximo {SIGNAL_MAX_AGE_SECONDS}s)."
-                    )
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    continue
 
+                # Primero comprobamos si la vela contiene realmente una señal.
+                # No tiene sentido hablar de "entrada descartada por antiguedad"
+                # cuando esa vela nunca produjo una entrada.
                 side = _signal_side(latest)
+
                 if side is None:
                     engine.mark_signal_processed(signal_timestamp)
                     print("Sin senal de entrada en esta vela.")
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                # Solo una señal real está sujeta a la ventana máxima de entrada.
+                candle_close_time = latest.name + timeframe_to_timedelta(TIMEFRAME)
+                now = datetime.now(timezone.utc)
+                age_seconds = (
+                    now - candle_close_time.to_pydatetime()
+                ).total_seconds()
+
+                if age_seconds > SIGNAL_MAX_AGE_SECONDS:
+                    engine.mark_signal_processed(signal_timestamp)
+                    print(
+                        f"Senal {side.upper()} descartada: "
+                        f"la vela cerro hace {age_seconds:.0f}s "
+                        f"(maximo {SIGNAL_MAX_AGE_SECONDS}s)."
+                    )
                     time.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
@@ -296,9 +308,21 @@ def main() -> None:
                 )
 
             except ExecutionError as exc:
-                print(f"Ejecucion bloqueada por seguridad: {exc}")
+                print(
+                    f"Ejecucion bloqueada por seguridad: {exc} | "
+                    f"reintento en {ERROR_RETRY_SECONDS}s"
+                )
+                time.sleep(ERROR_RETRY_SECONDS)
+                continue
+
             except Exception as exc:
-                print(f"Error en ciclo principal: {type(exc).__name__}: {exc}")
+                print(
+                    f"Error en ciclo principal: "
+                    f"{type(exc).__name__}: {exc} | "
+                    f"reintento en {ERROR_RETRY_SECONDS}s"
+                )
+                time.sleep(ERROR_RETRY_SECONDS)
+                continue
 
             time.sleep(POLL_INTERVAL_SECONDS)
 

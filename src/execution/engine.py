@@ -144,6 +144,13 @@ class BinanceExecutionEngine:
             self.exchange.enable_demo_trading(True)
 
         self.exchange.load_markets()
+        # Sincronizamos explícitamente el offset con el reloj de Binance.
+        # adjustForTimeDifference=True sigue actuando como mecanismo principal,
+        # pero esto fuerza una sincronización inicial.
+        try:
+            self.exchange.load_time_difference()
+        except Exception as exc:
+            print(f"Aviso: no se pudo sincronizar inicialmente el reloj con Binance: {exc}")
 
     @staticmethod
     def _client_id(prefix: str) -> str:
@@ -153,6 +160,24 @@ class BinanceExecutionEngine:
     def _is_noop_error(exc: Exception, code: str, text: str) -> bool:
         message = str(exc).lower()
         return code in message or text.lower() in message
+
+    @staticmethod
+    def _is_timestamp_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "-1021" in message
+            or "timestamp for this request is outside of the recvwindow" in message
+            or "timestamp for this request was" in message
+        )
+
+
+    def _resync_time(self) -> None:
+        try:
+            self.exchange.load_time_difference()
+        except Exception as exc:
+            raise ExecutionError(
+                f"No se pudo resincronizar el reloj con Binance: {exc}"
+            ) from exc
 
     @staticmethod
     def _now_iso() -> str:
@@ -323,7 +348,15 @@ class BinanceExecutionEngine:
         try:
             balance = self.exchange.fetch_balance()
         except Exception as exc:
-            raise ExecutionError(f"Error obteniendo balance Futures: {exc}") from exc
+            if not self._is_timestamp_error(exc):
+                raise ExecutionError(f"Error obteniendo balance Futures: {exc}") from exc
+
+            self._resync_time()
+
+            try:
+                balance = self.exchange.fetch_balance()
+            except Exception as retry_exc:
+                raise ExecutionError(f"Error obteniendo balance Futures tras resincronizar el reloj: {retry_exc}") from retry_exc
 
         info = balance.get("info") or {}
 
@@ -381,17 +414,24 @@ class BinanceExecutionEngine:
         notional = base_qty * price
         min_cost = (limits.get("cost") or {}).get("min")
         if min_cost is not None and notional < float(min_cost):
-            raise ExecutionError(
-                f"Notional {notional:.4f} inferior al minimo ({min_cost})."
-            )
+            raise ExecutionError(f"Notional {notional:.4f} inferior al minimo ({min_cost}).")
         return contracts
 
     def _fetch_open_position(self, symbol: str) -> Optional[PositionSnapshot]:
         try:
             positions = self.exchange.fetch_positions([symbol])
         except Exception as exc:
-            raise ExecutionError(f"No se pudieron consultar posiciones: {exc}") from exc
+            if not self._is_timestamp_error(exc):
+                raise ExecutionError(f"No se pudieron consultar posiciones: {exc}") from exc
+            # Un -1021 es seguro de reintentar porque fetch_positions es
+            # exclusivamente una lectura: no puede duplicar operaciones.
+            self._resync_time()
 
+            try:
+                positions = self.exchange.fetch_positions([symbol])
+            except Exception as retry_exc:
+                raise ExecutionError(f"No se pudieron consultar posiciones tras resincronizar el reloj: {retry_exc}") from retry_exc
+            
         active: list[PositionSnapshot] = []
         for position in positions:
             contracts = abs(float(position.get("contracts") or 0.0))

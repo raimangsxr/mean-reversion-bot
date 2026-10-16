@@ -9,15 +9,39 @@ import pandas as pd
 OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
+_PUBLIC_FUTURES_EXCHANGE: Optional[ccxt.binance] = None
+
+
 def _make_public_futures_exchange() -> ccxt.binance:
-    # Datos públicos de Binance USD-M Futures. Para el backtest preferimos el
-    # mercado real incluso cuando la ejecución live está en Testnet.
-    return ccxt.binance(
-        {
-            "enableRateLimit": True,
-            "options": {"defaultType": "future"},
-        }
-    )
+    """
+    Cliente público Binance USD-M reutilizable.
+
+    Evitamos crear un exchange y ejecutar load_markets() en cada poll.
+    Las consultas públicas son siempre contra el mercado real incluso
+    cuando la ejecución está en Demo Trading.
+    """
+    global _PUBLIC_FUTURES_EXCHANGE
+
+    if _PUBLIC_FUTURES_EXCHANGE is None:
+        exchange = ccxt.binance(
+            {
+                "enableRateLimit": True,
+                "timeout": 15_000,
+                "options": {
+                    "defaultType": "future",
+                },
+            }
+        )
+
+        # Solo afectan a fallos HTTP/red de las consultas públicas.
+        exchange.options["maxRetriesOnFailure"] = 2
+        exchange.options["maxRetriesOnFailureDelay"] = 1_000
+
+        exchange.load_markets()
+
+        _PUBLIC_FUTURES_EXCHANGE = exchange
+
+    return _PUBLIC_FUTURES_EXCHANGE
 
 
 def _to_dataframe(ohlcv: list[list[float]]) -> pd.DataFrame:
@@ -63,8 +87,11 @@ def fetch_binance_klines(
 ) -> pd.DataFrame:
     """Descarga velas recientes del contrato USD-M Futures."""
     exchange = _make_public_futures_exchange()
-    exchange.load_markets()
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    ohlcv = exchange.fetch_ohlcv(
+        symbol,
+        timeframe=timeframe,
+        limit=limit,
+    )
     df = _to_dataframe(ohlcv)
     return keep_closed_candles(df, timeframe) if closed_only else df
 
@@ -78,7 +105,6 @@ def fetch_binance_history(
 ) -> pd.DataFrame:
     """Descarga OHLCV Futures paginado entre start (incl.) y end (excl.)."""
     exchange = _make_public_futures_exchange()
-    exchange.load_markets()
     timeframe_ms = exchange.parse_timeframe(timeframe) * 1000
 
     since = exchange.parse8601(start)
