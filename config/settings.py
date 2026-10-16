@@ -32,19 +32,15 @@ Z_THRESHOLD = float(os.getenv("Z_THRESHOLD", "2.2"))
 TREND_WINDOW = int(os.getenv("TREND_WINDOW", "200"))
 ATR_WINDOW = int(os.getenv("ATR_WINDOW", "14"))
 
-# Filtro de regimen V5. El live usa REGIME_MODE; el backtest compara baseline e intersecciones local+HTF.
+# Filtro de regimen de la estrategia V8 final.
 REGIME_MODE = os.getenv("REGIME_MODE", "1h_sma200_4h_ema200").lower()
 REGIME_TIMEFRAME = os.getenv("REGIME_TIMEFRAME", "4h")
 REGIME_EMA_WINDOW = int(os.getenv("REGIME_EMA_WINDOW", "200"))
 REGIME_SLOPE_LOOKBACK = int(os.getenv("REGIME_SLOPE_LOOKBACK", "6"))
 
-# Tras los experimentos A/B/C, la baseline pasa a ser confirmacion + RR fijo.
+# Estrategia V8 final: entrada confirmada y salida por RR fijo.
 ENTRY_MODE = os.getenv("ENTRY_MODE", "confirmed").lower()
 EXIT_MODE = os.getenv("EXIT_MODE", "fixed_rr").lower()
-
-# Solo se usa si EXIT_MODE=z_reversion.
-MEAN_EXIT_Z = float(os.getenv("MEAN_EXIT_Z", "0.0"))
-MAX_HOLDING_BARS = int(os.getenv("MAX_HOLDING_BARS", "48"))
 
 ATR_MULTIPLIER = float(os.getenv("ATR_MULTIPLIER", "1.5"))
 # Valor live. El barrido de backtest NO modifica este parametro.
@@ -59,32 +55,11 @@ MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.10"))  # 10%
 CASH_BUFFER_PCT = float(os.getenv("CASH_BUFFER_PCT", "0.05"))  # 5%
 
 # -----------------------------------------------------------------------------
-# Costes / ejecucion de backtest V6
+# Costes / ejecucion del backtest V8 final
 # -----------------------------------------------------------------------------
-# Se mantienen por compatibilidad con scripts anteriores, pero V6 usa las
-# variables BACKTEST_* de abajo para separar maker/taker y slippage por tipo
-# de ejecucion.
-TRADING_FEE = float(os.getenv("TRADING_FEE", "0.0005"))
-SLIPPAGE = float(os.getenv("SLIPPAGE", "0.0005"))
-
 # Supuestos de investigacion. Ajustalos a las comisiones efectivas de tu cuenta.
-# Valores de referencia para usuario regular USD-M: maker 0.02%, taker 0.05%.
 BACKTEST_TAKER_FEE = float(os.getenv("BACKTEST_TAKER_FEE", "0.0005"))
 BACKTEST_MAKER_FEE = float(os.getenv("BACKTEST_MAKER_FEE", "0.0002"))
-
-# Perfiles de ejecucion:
-# - all_taker: entrada, stop y TP pagan taker; todos sufren slippage de mercado.
-# - maker_tp: entrada y stop son taker; TP es LIMIT maker y no aplica slippage
-#   de mercado en el modelo. El OHLC no modela cola/partial fills, por lo que
-#   maker_tp es un escenario de ejecucion que debe validarse en Testnet/live.
-BACKTEST_EXECUTION_PROFILES = tuple(
-    value.strip().lower()
-    for value in os.getenv(
-        "BACKTEST_EXECUTION_PROFILES",
-        "all_taker,maker_tp",
-    ).split(",")
-    if value.strip()
-)
 
 # Slippage adverso aplicado a ejecuciones de mercado, expresado en basis points.
 BACKTEST_MARKET_SLIPPAGE_BPS = tuple(
@@ -96,26 +71,33 @@ BACKTEST_MARKET_SLIPPAGE_BPS = tuple(
     if value.strip()
 )
 
-# Estrategia congelada para el estudio de costes V6.
-BACKTEST_V6_REGIME_MODE = os.getenv(
-    "BACKTEST_V6_REGIME_MODE",
-    "1h_sma200_4h_ema200",
-).lower()
-
 # -----------------------------------------------------------------------------
 # Ejecucion / persistencia
 # -----------------------------------------------------------------------------
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
-
-# Ante errores transitorios de red/API reintentamos antes que el poll normal.
-# Es importante porque la ventana de entrada es de solo 300 segundos.
 ERROR_RETRY_SECONDS = int(os.getenv("ERROR_RETRY_SECONDS", "10"))
+SIGNAL_MAX_AGE_SECONDS = int(os.getenv("SIGNAL_MAX_AGE_SECONDS", "60"))
 
-SIGNAL_MAX_AGE_SECONDS = int(os.getenv("SIGNAL_MAX_AGE_SECONDS", "300"))
+# V8 final: LIMIT -3bp anclada al close de la vela de senal,
+# espera 7m y fallback MARKET solo si el precio sigue dentro de +5bp respecto
+# al precio observado al iniciar (t=0).
+ENTRY_EXECUTION_MODE = os.getenv(
+    "ENTRY_EXECUTION_MODE",
+    "pullback_limit",
+).lower()
+ENTRY_LIMIT_OFFSET_BPS = float(os.getenv("ENTRY_LIMIT_OFFSET_BPS", "3.0"))
+ENTRY_LIMIT_WAIT_SECONDS = int(os.getenv("ENTRY_LIMIT_WAIT_SECONDS", "420"))
+ENTRY_FALLBACK_CAP_BPS = float(os.getenv("ENTRY_FALLBACK_CAP_BPS", "5.0"))
+ENTRY_PENDING_POLL_SECONDS = int(os.getenv("ENTRY_PENDING_POLL_SECONDS", "10"))
+# Si el proceso despierta demasiado tarde, no ejecutamos un fallback que ya no
+# representa el experimento de 7 minutos. Se cancela la senal.
+ENTRY_FALLBACK_MAX_LATENESS_SECONDS = int(
+    os.getenv("ENTRY_FALLBACK_MAX_LATENESS_SECONDS", "60")
+)
+
 STATE_FILE = os.getenv("STATE_FILE", "state/bot_state.json")
 
-# V7 live execution: TP fijo como LIMIT reduceOnly post-only (maker).
-# trigger_market conserva el comportamiento anterior por compatibilidad/migracion.
+# V8 final: TP fijo como LIMIT reduceOnly post-only (maker).
 TAKE_PROFIT_ORDER_MODE = os.getenv(
     "TAKE_PROFIT_ORDER_MODE",
     "maker_limit",
@@ -126,7 +108,7 @@ EXECUTION_JOURNAL_FILE = os.getenv(
 )
 
 # -----------------------------------------------------------------------------
-# Backtest V6: estrategia V5 congelada; se varia RR y modelo de ejecucion
+# Backtest V8 final: control MARKET inmediato vs politica pullback/no-chase; grid RR/slippage
 # -----------------------------------------------------------------------------
 BACKTEST_START = os.getenv("BACKTEST_START", "2020-01-01T00:00:00Z")
 BACKTEST_END = os.getenv(
@@ -145,41 +127,37 @@ BACKTEST_TP_RATIOS = tuple(
     if value.strip()
 )
 
-# Modos que se comparan en el research grid.
-# Valores validos: both,long,short
-BACKTEST_SIDE_MODES = tuple(
+# Modos de entrada que compara el backtest principal.
+# - market_0m: control MARKET inmediato + TP maker.
+# - pullback_limit: entrada V8 final, LIMIT -offset / wait / cap no-chase.
+BACKTEST_ENTRY_EXECUTION_MODES = tuple(
     value.strip().lower()
     for value in os.getenv(
-        "BACKTEST_SIDE_MODES",
-        "long",
+        "BACKTEST_ENTRY_EXECUTION_MODES",
+        "market_0m,pullback_limit",
     ).split(",")
     if value.strip()
 )
 
-# Se conserva por compatibilidad con V5, pero V6 usa BACKTEST_V6_REGIME_MODE.
-BACKTEST_REGIME_MODES = tuple(
-    value.strip().lower()
-    for value in os.getenv(
-        "BACKTEST_REGIME_MODES",
-        "1h_sma200_4h_ema200",
-    ).split(",")
-    if value.strip()
+# Cache 1m reutilizable. El backtest descarga solo las horas posteriores a
+# senales candidatas que falten en este fichero.
+BACKTEST_MINUTE_CACHE_FILE = os.getenv(
+    "BACKTEST_MINUTE_CACHE_FILE",
+    "state/backtest_1m_cache.csv",
+)
+BACKTEST_SUMMARY_FILE = os.getenv(
+    "BACKTEST_SUMMARY_FILE",
+    "state/backtest_v8_summary.csv",
+)
+BACKTEST_ANNUAL_FILE = os.getenv(
+    "BACKTEST_ANNUAL_FILE",
+    "state/backtest_v8_annual.csv",
+)
+BACKTEST_TRADES_FILE = os.getenv(
+    "BACKTEST_TRADES_FILE",
+    "state/backtest_v8_trades.csv",
 )
 
-BACKTEST_YEARLY_BREAKDOWN = (
-    os.getenv("BACKTEST_YEARLY_BREAKDOWN", "True").lower() == "true"
-)
-BACKTEST_WALK_FORWARD = (
-    os.getenv("BACKTEST_WALK_FORWARD", "True").lower() == "true"
-)
-# Primer test anual despues de disponer al menos de N anos previos de historia.
-BACKTEST_WALK_FORWARD_MIN_TRAIN_YEARS = int(
-    os.getenv("BACKTEST_WALK_FORWARD_MIN_TRAIN_YEARS", "2")
-)
-
-# Compatibilidad con scripts anteriores; V3 ya no usa el corte 70/30 ni A/B/C.
-BACKTEST_TRAIN_FRACTION = float(os.getenv("BACKTEST_TRAIN_FRACTION", "0.70"))
-BACKTEST_COMPARE_VARIANTS = False
 
 
 def validate_settings() -> None:
@@ -187,43 +165,52 @@ def validate_settings() -> None:
         raise ValueError("El motor esta disenado para Binance USD-M Futures.")
     if POSITION_MODE != "one_way":
         raise ValueError("Esta version solo soporta POSITION_MODE='one_way'.")
-    if MARGIN_MODE not in {"isolated", "cross"}:
-        raise ValueError("MARGIN_MODE debe ser 'isolated' o 'cross'.")
+    if MARGIN_MODE != "isolated":
+        raise ValueError("V8 final requiere MARGIN_MODE=isolated.")
     if not 1 <= LEVERAGE <= 125:
         raise ValueError("LEVERAGE debe estar entre 1 y 125.")
     if TRIGGER_PRICE_TYPE not in {"MARK_PRICE", "CONTRACT_PRICE"}:
         raise ValueError("TRIGGER_PRICE_TYPE debe ser MARK_PRICE o CONTRACT_PRICE.")
-    if TAKE_PROFIT_ORDER_MODE not in {"maker_limit", "trigger_market"}:
-        raise ValueError(
-            "TAKE_PROFIT_ORDER_MODE debe ser maker_limit o trigger_market."
-        )
+    if TAKE_PROFIT_ORDER_MODE != "maker_limit":
+        raise ValueError("V8 final requiere TAKE_PROFIT_ORDER_MODE=maker_limit.")
     if not EXECUTION_JOURNAL_FILE.strip():
         raise ValueError("EXECUTION_JOURNAL_FILE no puede estar vacio.")
-    if not ENABLE_LONGS and not ENABLE_SHORTS:
-        raise ValueError("Debe estar habilitado al menos LONG o SHORT.")
-    valid_regime_modes = {
-        "1h_sma200",
-        "4h_ema200",
-        "4h_ema200_slope",
-        "1h_sma200_4h_ema200",
-        "1h_sma200_4h_ema200_slope",
-    }
-    if REGIME_MODE not in valid_regime_modes:
+    if POLL_INTERVAL_SECONDS <= 0:
+        raise ValueError("POLL_INTERVAL_SECONDS debe ser positivo.")
+    if ERROR_RETRY_SECONDS <= 0:
+        raise ValueError("ERROR_RETRY_SECONDS debe ser positivo.")
+    if SIGNAL_MAX_AGE_SECONDS <= 0:
+        raise ValueError("SIGNAL_MAX_AGE_SECONDS debe ser positivo.")
+    if ENTRY_EXECUTION_MODE != "pullback_limit":
+        raise ValueError("V8 final requiere ENTRY_EXECUTION_MODE=pullback_limit.")
+    if ENTRY_LIMIT_OFFSET_BPS <= 0:
+        raise ValueError("ENTRY_LIMIT_OFFSET_BPS debe ser positivo.")
+    if ENTRY_LIMIT_WAIT_SECONDS <= 0:
+        raise ValueError("ENTRY_LIMIT_WAIT_SECONDS debe ser positivo.")
+    if ENTRY_FALLBACK_CAP_BPS < 0:
+        raise ValueError("ENTRY_FALLBACK_CAP_BPS no puede ser negativo.")
+    if ENTRY_PENDING_POLL_SECONDS <= 0:
+        raise ValueError("ENTRY_PENDING_POLL_SECONDS debe ser positivo.")
+    if ENTRY_PENDING_POLL_SECONDS > ENTRY_LIMIT_WAIT_SECONDS:
         raise ValueError(
-            "REGIME_MODE no es un modo de regimen valido."
+            "ENTRY_PENDING_POLL_SECONDS no puede superar ENTRY_LIMIT_WAIT_SECONDS."
         )
+    if ENTRY_FALLBACK_MAX_LATENESS_SECONDS < 0:
+        raise ValueError(
+            "ENTRY_FALLBACK_MAX_LATENESS_SECONDS no puede ser negativo."
+        )
+    if not ENABLE_LONGS or ENABLE_SHORTS:
+        raise ValueError("V8 final requiere ENABLE_LONGS=True y ENABLE_SHORTS=False.")
+    if REGIME_MODE != "1h_sma200_4h_ema200":
+        raise ValueError("V8 final requiere REGIME_MODE=1h_sma200_4h_ema200.")
     if REGIME_EMA_WINDOW <= 0:
         raise ValueError("REGIME_EMA_WINDOW debe ser positivo.")
     if REGIME_SLOPE_LOOKBACK <= 0:
         raise ValueError("REGIME_SLOPE_LOOKBACK debe ser positivo.")
-    if ENTRY_MODE not in {"extreme", "confirmed"}:
-        raise ValueError("ENTRY_MODE debe ser 'extreme' o 'confirmed'.")
-    if EXIT_MODE not in {"fixed_rr", "z_reversion"}:
-        raise ValueError("EXIT_MODE debe ser 'fixed_rr' o 'z_reversion'.")
-    if MEAN_EXIT_Z < 0:
-        raise ValueError("MEAN_EXIT_Z no puede ser negativo.")
-    if MAX_HOLDING_BARS <= 0:
-        raise ValueError("MAX_HOLDING_BARS debe ser positivo.")
+    if ENTRY_MODE != "confirmed":
+        raise ValueError("V8 final requiere ENTRY_MODE=confirmed.")
+    if EXIT_MODE != "fixed_rr":
+        raise ValueError("V8 final requiere EXIT_MODE=fixed_rr.")
     if not 0 < RISK_PER_TRADE <= 1:
         raise ValueError("RISK_PER_TRADE debe estar entre 0 y 1.")
     if not 0 < MAX_POSITION_PCT <= 1:
@@ -234,17 +221,8 @@ def validate_settings() -> None:
         raise ValueError("RISK_REWARD_RATIO debe ser positivo.")
     if ATR_MULTIPLIER <= 0:
         raise ValueError("ATR_MULTIPLIER debe ser positivo.")
-    if TRADING_FEE < 0 or SLIPPAGE < 0:
-        raise ValueError("TRADING_FEE y SLIPPAGE no pueden ser negativos.")
     if BACKTEST_TAKER_FEE < 0 or BACKTEST_MAKER_FEE < 0:
         raise ValueError("BACKTEST_TAKER_FEE y BACKTEST_MAKER_FEE no pueden ser negativos.")
-    valid_execution_profiles = {"all_taker", "maker_tp"}
-    if not BACKTEST_EXECUTION_PROFILES or any(
-        value not in valid_execution_profiles for value in BACKTEST_EXECUTION_PROFILES
-    ):
-        raise ValueError(
-            "BACKTEST_EXECUTION_PROFILES solo puede contener: all_taker,maker_tp."
-        )
     if not BACKTEST_MARKET_SLIPPAGE_BPS or any(
         value < 0 for value in BACKTEST_MARKET_SLIPPAGE_BPS
     ):
@@ -253,22 +231,14 @@ def validate_settings() -> None:
         )
     if not BACKTEST_TP_RATIOS or any(value <= 0 for value in BACKTEST_TP_RATIOS):
         raise ValueError("BACKTEST_TP_RATIOS debe contener ratios positivos.")
-    valid_side_modes = {"both", "long", "short"}
-    if not BACKTEST_SIDE_MODES or any(
-        value not in valid_side_modes for value in BACKTEST_SIDE_MODES
+    valid_entry_execution_modes = {"market_0m", "pullback_limit"}
+    if not BACKTEST_ENTRY_EXECUTION_MODES or any(
+        value not in valid_entry_execution_modes
+        for value in BACKTEST_ENTRY_EXECUTION_MODES
     ):
         raise ValueError(
-            "BACKTEST_SIDE_MODES solo puede contener: both,long,short."
+            "BACKTEST_ENTRY_EXECUTION_MODES solo puede contener: "
+            "market_0m,pullback_limit."
         )
-    if not BACKTEST_REGIME_MODES or any(
-        value not in valid_regime_modes for value in BACKTEST_REGIME_MODES
-    ):
-        raise ValueError(
-            "BACKTEST_REGIME_MODES solo puede contener: "
-            "1h_sma200,1h_sma200_4h_ema200,1h_sma200_4h_ema200_slope "
-            "(los modos 4h puros se conservan por compatibilidad)."
-        )
-    if BACKTEST_V6_REGIME_MODE not in valid_regime_modes:
-        raise ValueError("BACKTEST_V6_REGIME_MODE no es un modo de regimen valido.")
-    if BACKTEST_WALK_FORWARD_MIN_TRAIN_YEARS < 1:
-        raise ValueError("BACKTEST_WALK_FORWARD_MIN_TRAIN_YEARS debe ser >= 1.")
+    if not BACKTEST_MINUTE_CACHE_FILE.strip():
+        raise ValueError("BACKTEST_MINUTE_CACHE_FILE no puede estar vacio.")

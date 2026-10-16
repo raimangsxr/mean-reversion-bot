@@ -64,7 +64,7 @@ def make_engine(tmp_path: Path) -> BinanceExecutionEngine:
     return engine
 
 
-def test_maker_tp_is_reduce_only_post_only_limit(tmp_path):
+def test_take_profit_is_reduce_only_post_only_limit(tmp_path):
     engine = make_engine(tmp_path)
 
     order = engine._create_take_profit_limit(

@@ -1,6 +1,8 @@
 .venv/
 venv/
 .env
+.DS_Store
+._*
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -8,3 +10,5 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+state/*
+!state/.gitkeep

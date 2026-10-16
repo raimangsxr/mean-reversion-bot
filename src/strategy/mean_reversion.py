@@ -6,10 +6,8 @@ import pandas as pd
 
 VALID_REGIME_MODES = {
     "1h_sma200",
-    # Se mantienen los modos V4 por compatibilidad/referencia.
     "4h_ema200",
     "4h_ema200_slope",
-    # V5: interseccion de tendencia local y macro.
     "1h_sma200_4h_ema200",
     "1h_sma200_4h_ema200_slope",
 }
@@ -287,7 +285,7 @@ class MeanReversionStrategy:
         ]:
             result[column] = pd.array(result[column], dtype="boolean").fillna(False)
 
-        # Alias historico usado por logs/codigo anterior.
+        # Alias usado por logs y diagnostico.
         result["sma_trend"] = result["local_sma"]
         return result
 

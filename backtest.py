@@ -1,43 +1,47 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import Path
 import math
+import os
+import time
 from typing import Optional
 
+import ccxt
 import numpy as np
 import pandas as pd
 
 from config.settings import (
     ATR_MULTIPLIER,
     ATR_WINDOW,
+    BACKTEST_ANNUAL_FILE,
     BACKTEST_END,
-    BACKTEST_EXECUTION_PROFILES,
+    BACKTEST_ENTRY_EXECUTION_MODES,
     BACKTEST_MAKER_FEE,
     BACKTEST_MARKET_SLIPPAGE_BPS,
+    BACKTEST_MINUTE_CACHE_FILE,
     BACKTEST_START,
+    BACKTEST_SUMMARY_FILE,
     BACKTEST_TAKER_FEE,
     BACKTEST_TP_RATIOS,
-    BACKTEST_V6_REGIME_MODE,
-    BACKTEST_WALK_FORWARD,
-    BACKTEST_WALK_FORWARD_MIN_TRAIN_YEARS,
-    BACKTEST_YEARLY_BREAKDOWN,
+    BACKTEST_TRADES_FILE,
     CASH_BUFFER_PCT,
+    ENTRY_FALLBACK_CAP_BPS,
+    ENTRY_LIMIT_OFFSET_BPS,
+    ENTRY_LIMIT_WAIT_SECONDS,
+    ENTRY_MODE,
     INITIAL_CAPITAL,
     LEVERAGE,
     LOOKBACK_WINDOW,
-    MAX_HOLDING_BARS,
     MAX_POSITION_PCT,
-    MEAN_EXIT_Z,
-    RISK_PER_TRADE,
-    RISK_REWARD_RATIO,
     REGIME_EMA_WINDOW,
     REGIME_MODE,
     REGIME_SLOPE_LOOKBACK,
     REGIME_TIMEFRAME,
-    SLIPPAGE,
+    RISK_PER_TRADE,
     SYMBOL,
+    TAKE_PROFIT_ORDER_MODE,
     TIMEFRAME,
-    TRADING_FEE,
     TREND_WINDOW,
     Z_THRESHOLD,
     validate_settings,
@@ -45,39 +49,108 @@ from config.settings import (
 from src.data.fetcher import fetch_binance_history
 from src.risk.manager import RiskManager
 from src.strategy.mean_reversion import MeanReversionStrategy
-from src.utils.metrics import calculate_sharpe_ratio
+
+
+# -----------------------------------------------------------------------------
+# Backtest V8 final. Compara la baseline MARKET inmediata con la politica V8 final
+# congelada y barre solo RR/slippage. No reabre la optimizacion de microentrada.
+# -----------------------------------------------------------------------------
+CACHE_FILE = Path(BACKTEST_MINUTE_CACHE_FILE)
+SUMMARY_FILE = Path(BACKTEST_SUMMARY_FILE)
+ANNUAL_FILE = Path(BACKTEST_ANNUAL_FILE)
+TRADES_FILE = Path(BACKTEST_TRADES_FILE)
+MARKET_SLIPPAGE_BPS = tuple(BACKTEST_MARKET_SLIPPAGE_BPS)
+RR_GRID = tuple(BACKTEST_TP_RATIOS)
+
+@dataclass(frozen=True)
+class EntryVariant:
+    name: str
+    kind: str  # market | limit_only | conditional
+    delay_minutes: int = 0
+    limit_offset_bps: float = 0.0
+    wait_minutes: int = 0
+    max_chase_bps: float = 0.0
+
+
+# Modos finales:
+# - market_0m: control MARKET inmediato + TP maker.
+# - pullback_limit: V8 final, LIMIT -offset desde signal close durante 7m y
+#   fallback MARKET solo si el precio al expirar no supera t=0 + cap.
+if ENTRY_LIMIT_WAIT_SECONDS % 60 != 0:
+    raise ValueError(
+        "ENTRY_LIMIT_WAIT_SECONDS debe ser multiplo de 60 para backtest 1m."
+    )
+
+ENTRY_VARIANT_MAP = {
+    "market_0m": EntryVariant("market_0m", "market", delay_minutes=0),
+    "pullback_limit": EntryVariant(
+        "pullback_limit",
+        "conditional",
+        limit_offset_bps=ENTRY_LIMIT_OFFSET_BPS,
+        wait_minutes=ENTRY_LIMIT_WAIT_SECONDS // 60,
+        max_chase_bps=ENTRY_FALLBACK_CAP_BPS,
+    ),
+}
+ENTRY_VARIANTS = tuple(
+    ENTRY_VARIANT_MAP[name] for name in BACKTEST_ENTRY_EXECUTION_MODES
+)
+
+@dataclass
+class EntryFill:
+    timestamp: pd.Timestamp
+    raw_price: float
+    fill_price: float
+    fee_rate: float
+    slippage_per_unit: float
+    liquidity: str
+    route: str
+    baseline_open: float
+
+    @property
+    def improvement_bps(self) -> float:
+        if self.baseline_open <= 0:
+            return float("nan")
+        # LONG: positivo = compramos mas barato que el open baseline.
+        return (self.baseline_open - self.fill_price) / self.baseline_open * 10_000.0
 
 
 @dataclass
 class OpenPosition:
-    side: str
     entry_time: pd.Timestamp
-    entry_index: int
-    signal_z: float
+    signal_time: pd.Timestamp
+    entry_hour: pd.Timestamp
     raw_entry_price: float
     entry_price: float
     amount: float
     entry_fee: float
     entry_slippage_cost: float
     stop_price: float
-    take_profit_price: Optional[float]
+    take_profit_price: float
     stop_distance: float
     initial_risk: float
+    entry_liquidity: str
+    entry_route: str
+    entry_delay_minutes: float
+    entry_improvement_bps: float
     max_favorable_distance: float = 0.0
     max_adverse_distance: float = 0.0
 
 
 @dataclass
 class ClosedTrade:
-    side: str
+    signal_time: pd.Timestamp
     entry_time: pd.Timestamp
     exit_time: pd.Timestamp
     entry_price: float
     exit_price: float
     amount: float
     stop_price: float
-    take_profit_price: Optional[float]
+    take_profit_price: float
     exit_reason: str
+    entry_liquidity: str
+    entry_route: str
+    entry_delay_minutes: float
+    entry_improvement_bps: float
     gross_before_costs: float
     gross_pnl: float
     fees: float
@@ -86,731 +159,652 @@ class ClosedTrade:
     r_multiple: float
     mfe_r: float
     mae_r: float
-    holding_bars: int
     holding_hours: float
-    entry_z: float
-    exit_z: float
 
 
 @dataclass
-class BacktestResult:
+class SimulationResult:
+    variant: str
+    risk_reward_ratio: float
+    slippage_bps: float
     initial_capital: float
     final_equity: float
     total_return: float
     max_drawdown: float
-    sharpe_ratio: float
+    attempted_signals: int
+    filled_entries: int
+    missed_entries: int
+    maker_entries: int
+    taker_entries: int
     trades: pd.DataFrame
-    equity_curve: pd.Series
-    open_position: Optional[OpenPosition]
 
 
-@dataclass(frozen=True)
-class ExecutionModel:
-    profile: str
-    taker_fee: float
-    maker_fee: float
-    market_slippage: float
-
-    def __post_init__(self) -> None:
-        if self.profile not in {"all_taker", "maker_tp"}:
-            raise ValueError("profile debe ser all_taker o maker_tp.")
-        if min(self.taker_fee, self.maker_fee, self.market_slippage) < 0:
-            raise ValueError("Fees/slippage no pueden ser negativos.")
-
-
-@dataclass(frozen=True)
-class ResearchCase:
-    side_mode: str
-    regime_mode: str
-    risk_reward_ratio: float
-    allow_longs: bool
-    allow_shorts: bool
-    execution_profile: str
-    market_slippage_bps: float
-
-
-def _entry_fill(
-    raw_open: float,
-    side: str,
-    slippage: float,
-) -> tuple[float, float]:
-    if side == "long":
-        fill = raw_open * (1.0 + slippage)
-    else:
-        fill = raw_open * (1.0 - slippage)
-    return fill, abs(fill - raw_open)
-
-
-def _market_exit_fill(
-    raw_open: float,
-    side: str,
-    slippage: float,
-) -> tuple[float, float]:
-    # LONG exits with SELL; SHORT exits with BUY.
-    if side == "long":
-        fill = raw_open * (1.0 - slippage)
-    else:
-        fill = raw_open * (1.0 + slippage)
-    return fill, abs(fill - raw_open)
-
-
-def _stop_fill(
-    bar_open: float,
-    stop_price: float,
-    side: str,
-    slippage: float,
-) -> tuple[float, float, float]:
-    if side == "long":
-        raw_reference = min(bar_open, stop_price)
-        fill = raw_reference * (1.0 - slippage)
-    else:
-        raw_reference = max(bar_open, stop_price)
-        fill = raw_reference * (1.0 + slippage)
-    return fill, raw_reference, abs(fill - raw_reference)
-
-
-def _take_profit_fill(
-    take_profit_price: float,
-    side: str,
-    slippage: float,
-) -> tuple[float, float, float]:
-    raw_reference = take_profit_price
-    if side == "long":
-        fill = raw_reference * (1.0 - slippage)
-    else:
-        fill = raw_reference * (1.0 + slippage)
-    return fill, raw_reference, abs(fill - raw_reference)
-
-
-def _pnl(side: str, entry_price: float, exit_price: float, amount: float) -> float:
-    if side == "long":
-        return (exit_price - entry_price) * amount
-    return (entry_price - exit_price) * amount
-
-
-def _unrealized_pnl(position: OpenPosition, mark_price: float) -> float:
-    return _pnl(position.side, position.entry_price, mark_price, position.amount)
-
-
-def _update_excursions(position: OpenPosition, high: float, low: float) -> None:
-    if position.side == "long":
-        favorable = max(0.0, high - position.entry_price)
-        adverse = max(0.0, position.entry_price - low)
-    else:
-        favorable = max(0.0, position.entry_price - low)
-        adverse = max(0.0, high - position.entry_price)
-
-    position.max_favorable_distance = max(
-        position.max_favorable_distance,
-        favorable,
+# -----------------------------------------------------------------------------
+# Datos 1m: cacheamos solo las horas posteriores a senales candidatas.
+# -----------------------------------------------------------------------------
+def _public_exchange() -> ccxt.binance:
+    exchange = ccxt.binance(
+        {
+            "enableRateLimit": True,
+            "timeout": 15_000,
+            "options": {"defaultType": "future"},
+        }
     )
-    position.max_adverse_distance = max(
-        position.max_adverse_distance,
-        adverse,
+    exchange.options["maxRetriesOnFailure"] = 2
+    exchange.options["maxRetriesOnFailureDelay"] = 1_000
+    exchange.load_markets()
+    return exchange
+
+
+MINUTE_COLUMNS = ["open", "high", "low", "close", "volume"]
+
+
+def _empty_minute_cache() -> pd.DataFrame:
+    """Cache 1m vacia con el mismo DatetimeIndex UTC que una cache cargada."""
+    return pd.DataFrame(
+        columns=MINUTE_COLUMNS,
+        index=pd.DatetimeIndex([], tz="UTC", name="timestamp"),
     )
 
 
-def _update_exit_point(position: OpenPosition, exit_price: float) -> None:
-    if position.side == "long":
-        favorable = max(0.0, exit_price - position.entry_price)
-        adverse = max(0.0, position.entry_price - exit_price)
-    else:
-        favorable = max(0.0, position.entry_price - exit_price)
-        adverse = max(0.0, exit_price - position.entry_price)
+def _load_minute_cache() -> pd.DataFrame:
+    if not CACHE_FILE.exists():
+        return _empty_minute_cache()
 
-    position.max_favorable_distance = max(
-        position.max_favorable_distance,
-        favorable,
+    try:
+        df = pd.read_csv(CACHE_FILE)
+    except pd.errors.EmptyDataError:
+        return _empty_minute_cache()
+
+    if df.empty:
+        return _empty_minute_cache()
+    if "timestamp" not in df.columns:
+        raise RuntimeError(
+            f"Cache 1m invalida: falta la columna timestamp en {CACHE_FILE}."
+        )
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    if df.empty:
+        return _empty_minute_cache()
+
+    return (
+        df.drop_duplicates(subset="timestamp", keep="last")
+        .sort_values("timestamp")
+        .set_index("timestamp")
     )
-    position.max_adverse_distance = max(
-        position.max_adverse_distance,
-        adverse,
+
+
+def _save_minute_cache(df: pd.DataFrame) -> None:
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    out = df.sort_index().reset_index().rename(columns={"index": "timestamp"})
+    out.to_csv(CACHE_FILE, index=False)
+
+
+def _minute_window(cache: pd.DataFrame, hour: pd.Timestamp) -> pd.DataFrame:
+    if cache.empty:
+        return cache.iloc[0:0]
+    if not isinstance(cache.index, pd.DatetimeIndex):
+        raise RuntimeError("La cache 1m debe usar DatetimeIndex.")
+
+    if hour.tzinfo is None:
+        hour = hour.tz_localize("UTC")
+    else:
+        hour = hour.tz_convert("UTC")
+
+    end = hour + pd.Timedelta(hours=1)
+    return cache.loc[(cache.index >= hour) & (cache.index < end)]
+
+
+def _candidate_entry_hours(signals: pd.DataFrame) -> list[pd.Timestamp]:
+    delta = pd.Timedelta(TIMEFRAME)
+    hours = [ts + delta for ts in signals.index[signals["entry_long"].fillna(False)]]
+    if not hours:
+        return []
+    # Solo horas para las que existe una vela 1h posterior en el dataset.
+    last_hour = signals.index[-1]
+    return sorted({h for h in hours if h <= last_hour})
+
+
+def ensure_minute_cache(signals: pd.DataFrame) -> pd.DataFrame:
+    cache = _load_minute_cache()
+    hours = _candidate_entry_hours(signals)
+    missing = [h for h in hours if len(_minute_window(cache, h)) < 60]
+
+    print(
+        f"Senales candidatas LONG: {len(hours)} | "
+        f"horas 1m en cache: {len(hours) - len(missing)} | por descargar: {len(missing)}"
+    )
+    if not missing:
+        return cache
+
+    exchange = _public_exchange()
+    new_frames: list[pd.DataFrame] = []
+
+    for n, hour in enumerate(missing, start=1):
+        since = int(hour.timestamp() * 1000)
+        rows = exchange.fetch_ohlcv(SYMBOL, timeframe="1m", since=since, limit=60)
+        frame = pd.DataFrame(
+            rows,
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        if not frame.empty:
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], unit="ms", utc=True)
+            frame = frame[(frame["timestamp"] >= hour) & (frame["timestamp"] < hour + pd.Timedelta(hours=1))]
+            frame = frame.set_index("timestamp")
+            new_frames.append(frame)
+
+        if n % 25 == 0 or n == len(missing):
+            if new_frames:
+                cache = pd.concat([cache, *new_frames])
+                cache = cache[~cache.index.duplicated(keep="last")].sort_index()
+                new_frames.clear()
+                _save_minute_cache(cache)
+            print(f"  cache 1m: {n}/{len(missing)} horas descargadas")
+
+        # CCXT ya limita la tasa; esta pausa pequena evita rafagas innecesarias.
+        time.sleep(0.02)
+
+    return cache
+
+
+# -----------------------------------------------------------------------------
+# Entrada micro.
+# -----------------------------------------------------------------------------
+def _market_entry_fill(
+    minute_hour: pd.DataFrame,
+    delay_minutes: int,
+    market_slippage_bps: float,
+    route: str,
+) -> Optional[EntryFill]:
+    if minute_hour.empty:
+        return None
+    minute_hour = minute_hour.sort_index()
+    target_time = minute_hour.index[0] + pd.Timedelta(minutes=delay_minutes)
+    if target_time not in minute_hour.index:
+        return None
+    row = minute_hour.loc[target_time]
+    raw = float(row["open"])
+    market_slippage = market_slippage_bps / 10_000.0
+    fill = raw * (1.0 + market_slippage)
+    return EntryFill(
+        timestamp=target_time,
+        raw_price=raw,
+        fill_price=fill,
+        fee_rate=BACKTEST_TAKER_FEE,
+        slippage_per_unit=fill - raw,
+        liquidity="taker",
+        route=route,
+        baseline_open=float(minute_hour.iloc[0]["open"]),
     )
 
 
-def _gap_through_stop(position: OpenPosition, bar_open: float) -> bool:
-    if position.side == "long":
-        return bar_open <= position.stop_price
-    return bar_open >= position.stop_price
+def _maker_limit_fill(
+    minute_hour: pd.DataFrame,
+    signal_close: float,
+    limit_offset_bps: float,
+    wait_minutes: int,
+) -> Optional[EntryFill]:
+    if minute_hour.empty or wait_minutes <= 0:
+        return None
+    minute_hour = minute_hour.sort_index()
+    target = signal_close * (1.0 - limit_offset_bps / 10_000.0)
+    search = minute_hour.iloc[:wait_minutes]
 
+    # La orden se envia una sola vez al inicio de la hora. Para considerarla
+    # post-only/maker, el mercado debe comenzar estrictamente por encima del
+    # BUY LIMIT. Si ya abre en/por debajo, modelamos rechazo/no colocacion y
+    # dejamos que la variante hibrida use su fallback MARKET.
+    if search.empty or float(search.iloc[0]["open"]) <= target:
+        return None
 
-def _intrabar_exit(
-    position: OpenPosition,
-    bar: pd.Series,
-    exit_mode: str,
-    execution: ExecutionModel,
-) -> Optional[tuple[str, float, float, float, float]]:
-    if position.side == "long":
-        stop_hit = float(bar["low"]) <= position.stop_price
-        tp_hit = (
-            exit_mode == "fixed_rr"
-            and position.take_profit_price is not None
-            and float(bar["high"]) >= position.take_profit_price
-        )
-    else:
-        stop_hit = float(bar["high"]) >= position.stop_price
-        tp_hit = (
-            exit_mode == "fixed_rr"
-            and position.take_profit_price is not None
-            and float(bar["low"]) <= position.take_profit_price
-        )
-
-    # Si SL y TP aparecen tocados en la misma vela, asumimos SL primero.
-    if stop_hit:
-        fill, raw_reference, slippage_per_unit = _stop_fill(
-            float(bar["open"]),
-            position.stop_price,
-            position.side,
-            execution.market_slippage,
-        )
-        return (
-            "stop_loss",
-            fill,
-            raw_reference,
-            slippage_per_unit,
-            execution.taker_fee,
-        )
-
-    if tp_hit and position.take_profit_price is not None:
-        if execution.profile == "maker_tp":
-            # TP LIMIT ya descansando en el libro: modelamos fill al precio
-            # objetivo y fee maker. No se modela queue position/partial fill.
-            tp_slippage = 0.0
-            fee_rate = execution.maker_fee
-        else:
-            tp_slippage = execution.market_slippage
-            fee_rate = execution.taker_fee
-        fill, raw_reference, slippage_per_unit = _take_profit_fill(
-            position.take_profit_price,
-            position.side,
-            tp_slippage,
-        )
-        return (
-            "take_profit",
-            fill,
-            raw_reference,
-            slippage_per_unit,
-            fee_rate,
-        )
-
+    # Una vez colocada, la LIMIT permanece descansando durante toda la ventana.
+    # Exigimos que el precio atraviese el limite (low < target), no un simple
+    # toque, para reducir el optimismo por posicion en cola.
+    for ts, row in search.iterrows():
+        if float(row["low"]) < target:
+            return EntryFill(
+                timestamp=ts,
+                raw_price=target,
+                fill_price=target,
+                fee_rate=BACKTEST_MAKER_FEE,
+                slippage_per_unit=0.0,
+                liquidity="maker",
+                route="limit_maker",
+                baseline_open=float(minute_hour.iloc[0]["open"]),
+            )
     return None
 
 
-def simulate(
-    signals: pd.DataFrame,
-    risk: RiskManager,
-    exit_mode: str = "fixed_rr",
-    max_holding_bars: int = MAX_HOLDING_BARS,
-    initial_capital: float = INITIAL_CAPITAL,
-    risk_reward_ratio: float = RISK_REWARD_RATIO,
-    allow_longs: bool = True,
-    allow_shorts: bool = True,
-    execution_model: Optional[ExecutionModel] = None,
-    entry_start: Optional[pd.Timestamp] = None,
-    entry_end: Optional[pd.Timestamp] = None,
-) -> BacktestResult:
-    """Backtest Futures con ejecucion NEXT-OPEN.
+def resolve_entry(
+    variant: EntryVariant,
+    minute_hour: pd.DataFrame,
+    signal_close: float,
+    market_slippage_bps: float,
+) -> Optional[EntryFill]:
+    if minute_hour.empty:
+        return None
 
-    V3 usa principalmente ``confirmed + fixed_rr`` y permite variar de forma
-    aislada el RR y el lado habilitado. ``entry_start``/``entry_end`` sirven
-    para evaluaciones temporales anuales sin recalcular los indicadores ni
-    permitir entradas fuera de la ventana de test.
-    """
-    if exit_mode not in {"fixed_rr", "z_reversion"}:
-        raise ValueError("exit_mode debe ser 'fixed_rr' o 'z_reversion'.")
-    if risk_reward_ratio <= 0:
-        raise ValueError("risk_reward_ratio debe ser positivo.")
-    if not allow_longs and not allow_shorts:
-        raise ValueError("Debe habilitarse al menos LONG o SHORT.")
-    if len(signals) < 2:
-        raise ValueError("Se necesitan al menos dos velas para simular.")
+    minute_hour = minute_hour.sort_index()
 
-    if execution_model is None:
-        # Compatibilidad con llamadas/tests anteriores. El grid V6 siempre pasa
-        # un modelo explicito.
-        execution_model = ExecutionModel(
-            profile="all_taker",
-            taker_fee=TRADING_FEE,
-            maker_fee=BACKTEST_MAKER_FEE,
-            market_slippage=SLIPPAGE,
+    if variant.kind == "market":
+        return _market_entry_fill(
+            minute_hour,
+            variant.delay_minutes,
+            market_slippage_bps,
+            route=f"market_{variant.delay_minutes}m",
         )
 
-    wallet = float(initial_capital)
+    if variant.kind in {"limit_only", "conditional"}:
+        maker = _maker_limit_fill(
+            minute_hour,
+            signal_close,
+            variant.limit_offset_bps,
+            variant.wait_minutes,
+        )
+        if maker is not None:
+            return maker
+
+        # LIMIT pura: si no existe pullback suficiente, cancelamos la senal.
+        if variant.kind == "limit_only":
+            return None
+
+        # Fallback condicional: solo perseguimos la senal si, al expirar la
+        # LIMIT, el mercado sigue cerca del precio que estaba disponible en t=0.
+        # La referencia es el open del primer minuto tras la senal.
+        fallback = _market_entry_fill(
+            minute_hour,
+            variant.wait_minutes,
+            market_slippage_bps,
+            route="market_fallback_conditional",
+        )
+        if fallback is None:
+            return None
+
+        baseline_open = float(minute_hour.iloc[0]["open"])
+        max_raw_price = baseline_open * (1.0 + variant.max_chase_bps / 10_000.0)
+        if fallback.raw_price <= max_raw_price:
+            return fallback
+
+        # Se ha escapado demasiado: no perseguimos el precio.
+        return None
+
+    raise ValueError(f"Entry kind no valido: {variant.kind}")
+
+
+# -----------------------------------------------------------------------------
+# Simulacion.
+# -----------------------------------------------------------------------------
+def _profit_factor(trades: pd.DataFrame, column: str = "pnl") -> float:
+    if trades.empty:
+        return float("nan")
+    gains = float(trades.loc[trades[column] > 0, column].sum())
+    losses = float(-trades.loc[trades[column] < 0, column].sum())
+    if losses == 0:
+        return float("inf") if gains > 0 else float("nan")
+    return gains / losses
+
+
+def _update_excursions(position: OpenPosition, high: float, low: float) -> None:
+    position.max_favorable_distance = max(
+        position.max_favorable_distance,
+        max(0.0, high - position.entry_price),
+    )
+    position.max_adverse_distance = max(
+        position.max_adverse_distance,
+        max(0.0, position.entry_price - low),
+    )
+
+
+def _risk_manager(risk_reward_ratio: float) -> RiskManager:
+    return RiskManager(
+        risk_per_trade=RISK_PER_TRADE,
+        max_position_pct=MAX_POSITION_PCT,
+        atr_multiplier=ATR_MULTIPLIER,
+        risk_reward_ratio=risk_reward_ratio,
+        cash_buffer_pct=CASH_BUFFER_PCT,
+    )
+
+
+def simulate_variant(
+    signals: pd.DataFrame,
+    minute_cache: pd.DataFrame,
+    variant: EntryVariant,
+    market_slippage_bps: float,
+    risk_reward_ratio: float,
+    entry_start: Optional[pd.Timestamp] = None,
+    entry_end: Optional[pd.Timestamp] = None,
+) -> SimulationResult:
+    wallet = float(INITIAL_CAPITAL)
+    risk = _risk_manager(risk_reward_ratio)
+    slippage = market_slippage_bps / 10_000.0
     position: Optional[OpenPosition] = None
-    closed_trades: list[ClosedTrade] = []
+    trades: list[ClosedTrade] = []
     equity_values: list[float] = []
     equity_index: list[pd.Timestamp] = []
+    attempted = 0
+    filled_entries = 0
+    missed_entries = 0
+    maker_entries = 0
+    taker_entries = 0
 
     def close_position(
         *,
         exit_time: pd.Timestamp,
-        exit_index: int,
-        exit_price: float,
-        raw_exit_price: float,
-        exit_slippage_per_unit: float,
+        fill: float,
+        raw_reference: float,
         exit_fee_rate: float,
-        exit_reason: str,
-        exit_z: float = float("nan"),
+        exit_slippage_per_unit: float,
+        reason: str,
     ) -> None:
         nonlocal wallet, position
         assert position is not None
 
-        _update_exit_point(position, exit_price)
-
-        exit_notional = position.amount * exit_price
-        exit_fee = exit_notional * exit_fee_rate
-        gross_before_costs = _pnl(
-            position.side,
-            position.raw_entry_price,
-            raw_exit_price,
-            position.amount,
-        )
-        gross_pnl = _pnl(
-            position.side,
-            position.entry_price,
-            exit_price,
-            position.amount,
-        )
+        _update_excursions(position, fill, fill)
+        gross_before_costs = (raw_reference - position.raw_entry_price) * position.amount
+        gross_pnl = (fill - position.entry_price) * position.amount
+        exit_fee = fill * position.amount * exit_fee_rate
         fees = position.entry_fee + exit_fee
-        slippage_cost = (
-            position.entry_slippage_cost
-            + exit_slippage_per_unit * position.amount
-        )
-        net_pnl = gross_pnl - fees
-
+        slippage_cost = position.entry_slippage_cost + exit_slippage_per_unit * position.amount
+        pnl = gross_pnl - fees
         wallet += gross_pnl - exit_fee
+        holding_hours = max(0.0, (exit_time - position.entry_time).total_seconds() / 3600.0)
 
-        r_multiple = (
-            net_pnl / position.initial_risk
-            if position.initial_risk > 0
-            else float("nan")
-        )
-        mfe_r = (
-            position.max_favorable_distance / position.stop_distance
-            if position.stop_distance > 0
-            else float("nan")
-        )
-        mae_r = (
-            position.max_adverse_distance / position.stop_distance
-            if position.stop_distance > 0
-            else float("nan")
-        )
-        holding_bars = max(0, exit_index - position.entry_index)
-        holding_hours = max(
-            0.0,
-            (exit_time - position.entry_time).total_seconds() / 3600.0,
-        )
-
-        closed_trades.append(
+        trades.append(
             ClosedTrade(
-                side=position.side,
+                signal_time=position.signal_time,
                 entry_time=position.entry_time,
                 exit_time=exit_time,
                 entry_price=position.entry_price,
-                exit_price=exit_price,
+                exit_price=fill,
                 amount=position.amount,
                 stop_price=position.stop_price,
                 take_profit_price=position.take_profit_price,
-                exit_reason=exit_reason,
+                exit_reason=reason,
+                entry_liquidity=position.entry_liquidity,
+                entry_route=position.entry_route,
+                entry_delay_minutes=position.entry_delay_minutes,
+                entry_improvement_bps=position.entry_improvement_bps,
                 gross_before_costs=gross_before_costs,
                 gross_pnl=gross_pnl,
                 fees=fees,
                 slippage_cost=slippage_cost,
-                pnl=net_pnl,
-                r_multiple=r_multiple,
-                mfe_r=mfe_r,
-                mae_r=mae_r,
-                holding_bars=holding_bars,
+                pnl=pnl,
+                r_multiple=pnl / position.initial_risk if position.initial_risk > 0 else float("nan"),
+                mfe_r=position.max_favorable_distance / position.stop_distance,
+                mae_r=position.max_adverse_distance / position.stop_distance,
                 holding_hours=holding_hours,
-                entry_z=position.signal_z,
-                exit_z=exit_z,
             )
         )
         position = None
 
-    for i in range(len(signals)):
-        timestamp = signals.index[i]
-        bar = signals.iloc[i]
-        previous = signals.iloc[i - 1] if i > 0 else None
-        closed_this_bar = False
+    def process_bar(ts: pd.Timestamp, row: pd.Series) -> bool:
+        """Procesa un bar para una posicion existente. True si cierra."""
+        nonlocal position
+        assert position is not None
 
-        # Cuando la ventana de test ya termino y no queda posicion abierta, no
-        # hay nada mas que simular.
-        if entry_end is not None and timestamp > entry_end and position is None:
+        bar_open = float(row["open"])
+        high = float(row["high"])
+        low = float(row["low"])
+
+        # Gap por debajo del stop: salida al open, no al stop teorico.
+        if bar_open <= position.stop_price:
+            raw = bar_open
+            fill = raw * (1.0 - slippage)
+            close_position(
+                exit_time=ts,
+                fill=fill,
+                raw_reference=raw,
+                exit_fee_rate=BACKTEST_TAKER_FEE,
+                exit_slippage_per_unit=raw - fill,
+                reason="stop_loss",
+            )
+            return True
+
+        stop_hit = low <= position.stop_price
+        tp_hit = high >= position.take_profit_price
+
+        # Convencion conservadora: si OHLC no permite conocer el orden y toca ambos,
+        # asumimos el caso conservador (SL primero).
+        if stop_hit:
+            raw = position.stop_price
+            fill = raw * (1.0 - slippage)
+            close_position(
+                exit_time=ts,
+                fill=fill,
+                raw_reference=raw,
+                exit_fee_rate=BACKTEST_TAKER_FEE,
+                exit_slippage_per_unit=raw - fill,
+                reason="stop_loss",
+            )
+            return True
+
+        if tp_hit:
+            raw = position.take_profit_price
+            fill = raw
+            close_position(
+                exit_time=ts,
+                fill=fill,
+                raw_reference=raw,
+                exit_fee_rate=BACKTEST_MAKER_FEE,
+                exit_slippage_per_unit=0.0,
+                reason="take_profit",
+            )
+            return True
+
+        _update_excursions(position, high, low)
+        return False
+
+    if entry_start is not None:
+        start_scan = entry_start - pd.Timedelta(TIMEFRAME)
+        work = signals.loc[signals.index >= start_scan]
+    else:
+        work = signals
+
+    for i in range(1, len(work)):
+        ts = work.index[i]
+        row = work.iloc[i]
+        previous = work.iloc[i - 1]
+        previous_ts = work.index[i - 1]
+        closed_this_hour = False
+
+        if entry_end is not None and ts > entry_end and position is None:
             break
 
-        # 1) Gestion de posicion abierta.
+        # Posicion que ya venia abierta al comenzar esta hora: usamos OHLC 1h.
         if position is not None:
-            if _gap_through_stop(position, float(bar["open"])):
-                fill, raw_reference, slip_per_unit = _stop_fill(
-                    float(bar["open"]),
-                    position.stop_price,
-                    position.side,
-                    execution_model.market_slippage,
-                )
-                close_position(
-                    exit_time=timestamp,
-                    exit_index=i,
-                    exit_price=fill,
-                    raw_exit_price=raw_reference,
-                    exit_slippage_per_unit=slip_per_unit,
-                    exit_fee_rate=execution_model.taker_fee,
-                    exit_reason="stop_loss",
-                )
-                closed_this_bar = True
+            closed_this_hour = process_bar(ts, row)
 
-            if position is not None and exit_mode == "z_reversion" and previous is not None:
-                if position.side == "long":
-                    mean_exit = bool(previous.get("exit_long_mean", False))
-                else:
-                    mean_exit = bool(previous.get("exit_short_mean", False))
-
-                bars_held = i - position.entry_index
-                timeout_exit = bars_held >= max_holding_bars
-                if mean_exit or timeout_exit:
-                    raw_reference = float(bar["open"])
-                    fill, slip_per_unit = _market_exit_fill(
-                        raw_reference,
-                        position.side,
-                        execution_model.market_slippage,
-                    )
-                    close_position(
-                        exit_time=timestamp,
-                        exit_index=i,
-                        exit_price=fill,
-                        raw_exit_price=raw_reference,
-                        exit_slippage_per_unit=slip_per_unit,
-                        exit_fee_rate=execution_model.taker_fee,
-                        exit_reason="mean_reversion" if mean_exit else "timeout",
-                        exit_z=float(previous.get("z_score", np.nan)),
-                    )
-                    closed_this_bar = True
-
-            if position is not None:
-                intrabar = _intrabar_exit(position, bar, exit_mode, execution_model)
-                if intrabar is not None:
-                    reason, fill, raw_reference, slip_per_unit, fee_rate = intrabar
-                    close_position(
-                        exit_time=timestamp,
-                        exit_index=i,
-                        exit_price=fill,
-                        raw_exit_price=raw_reference,
-                        exit_slippage_per_unit=slip_per_unit,
-                        exit_fee_rate=fee_rate,
-                        exit_reason=reason,
-                    )
-                    closed_this_bar = True
-                else:
-                    _update_excursions(
-                        position,
-                        high=float(bar["high"]),
-                        low=float(bar["low"]),
-                    )
-
-        # 2) Entrada NEXT-OPEN.
         entry_in_window = (
-            (entry_start is None or timestamp >= entry_start)
-            and (entry_end is None or timestamp <= entry_end)
+            (entry_start is None or ts >= entry_start)
+            and (entry_end is None or ts <= entry_end)
         )
-        if i > 0 and position is None and not closed_this_bar and entry_in_window:
-            assert previous is not None
-            side: Optional[str] = None
-            if allow_longs and bool(previous.get("entry_long", False)):
-                side = "long"
-            elif allow_shorts and bool(previous.get("entry_short", False)):
-                side = "short"
 
-            atr = float(previous.get("atr", np.nan))
-            if side and math.isfinite(atr) and atr > 0 and wallet > 0:
-                raw_entry = float(bar["open"])
-                plan = risk.build_plan(
-                    side=side,
-                    account_equity=wallet,
-                    free_margin=wallet,
-                    expected_entry_price=raw_entry,
-                    atr=atr,
-                    leverage=LEVERAGE,
-                )
+        if (
+            position is None
+            and not closed_this_hour
+            and entry_in_window
+            and bool(previous.get("entry_long", False))
+        ):
+            attempted += 1
+            minute_hour = _minute_window(minute_cache, ts)
+            fill = resolve_entry(
+                variant,
+                minute_hour,
+                signal_close=float(previous["close"]),
+                market_slippage_bps=market_slippage_bps,
+            )
 
-                amount = plan.base_amount
-                entry_price, entry_slippage_per_unit = _entry_fill(
-                    raw_entry,
-                    side,
-                    execution_model.market_slippage,
-                )
-                entry_fee = amount * entry_price * execution_model.taker_fee
-                stop_distance = atr * ATR_MULTIPLIER
-
-                if side == "long":
-                    stop_price = entry_price - stop_distance
-                    take_profit_price = (
-                        entry_price + stop_distance * risk_reward_ratio
-                        if exit_mode == "fixed_rr"
-                        else None
+            if fill is None:
+                missed_entries += 1
+            else:
+                atr = float(previous.get("atr", np.nan))
+                if math.isfinite(atr) and atr > 0 and wallet > 0:
+                    plan = risk.build_plan(
+                        side="long",
+                        account_equity=wallet,
+                        free_margin=wallet,
+                        expected_entry_price=fill.fill_price,
+                        atr=atr,
+                        leverage=LEVERAGE,
                     )
-                else:
-                    stop_price = entry_price + stop_distance
-                    take_profit_price = (
-                        entry_price - stop_distance * risk_reward_ratio
-                        if exit_mode == "fixed_rr"
-                        else None
-                    )
-
-                if amount > 0 and stop_price > 0 and (
-                    take_profit_price is None or take_profit_price > 0
-                ):
+                    amount = plan.base_amount
+                    entry_fee = amount * fill.fill_price * fill.fee_rate
                     wallet -= entry_fee
+                    filled_entries += 1
+                    if fill.liquidity == "maker":
+                        maker_entries += 1
+                    else:
+                        taker_entries += 1
                     position = OpenPosition(
-                        side=side,
-                        entry_time=timestamp,
-                        entry_index=i,
-                        signal_z=float(previous.get("z_score", np.nan)),
-                        raw_entry_price=raw_entry,
-                        entry_price=entry_price,
+                        entry_time=fill.timestamp,
+                        signal_time=previous_ts,
+                        entry_hour=ts,
+                        raw_entry_price=fill.raw_price,
+                        entry_price=fill.fill_price,
                         amount=amount,
                         entry_fee=entry_fee,
-                        entry_slippage_cost=entry_slippage_per_unit * amount,
-                        stop_price=stop_price,
-                        take_profit_price=take_profit_price,
-                        stop_distance=stop_distance,
-                        initial_risk=amount * stop_distance,
+                        entry_slippage_cost=fill.slippage_per_unit * amount,
+                        stop_price=fill.fill_price - plan.stop_distance,
+                        take_profit_price=fill.fill_price + plan.stop_distance * risk_reward_ratio,
+                        stop_distance=plan.stop_distance,
+                        initial_risk=amount * plan.stop_distance,
+                        entry_liquidity=fill.liquidity,
+                        entry_route=fill.route,
+                        entry_delay_minutes=(fill.timestamp - ts).total_seconds() / 60.0,
+                        entry_improvement_bps=fill.improvement_bps,
                     )
 
-                    intrabar = _intrabar_exit(position, bar, exit_mode, execution_model)
-                    if intrabar is not None:
-                        reason, fill, raw_reference, slip_per_unit, fee_rate = intrabar
-                        close_position(
-                            exit_time=timestamp,
-                            exit_index=i,
-                            exit_price=fill,
-                            raw_exit_price=raw_reference,
-                            exit_slippage_per_unit=slip_per_unit,
-                            exit_fee_rate=fee_rate,
-                            exit_reason=reason,
-                        )
-                    else:
-                        _update_excursions(
-                            position,
-                            high=float(bar["high"]),
-                            low=float(bar["low"]),
-                        )
+                    # Para la hora de entrada usamos 1m DESDE el fill.
+                    # MARKET entra al open del minuto, por lo que todo su OHLC
+                    # es posterior al fill. En una LIMIT maker el fill ocurre en
+                    # algun punto intraminuto: permitimos SL en ese mismo minuto
+                    # (conservador y temporalmente posible al cruzar hacia abajo),
+                    # pero NO permitimos TP usando su high porque podria haberse
+                    # producido antes del fill. El TP se evalua desde el minuto
+                    # siguiente.
+                    after_fill = minute_hour.loc[minute_hour.index >= fill.timestamp]
+                    for minute_ts, minute_row in after_fill.iterrows():
+                        if position is None:
+                            break
+
+                        if fill.liquidity == "maker" and minute_ts == fill.timestamp:
+                            low = float(minute_row["low"])
+                            if low <= position.stop_price:
+                                raw = position.stop_price
+                                exit_fill = raw * (1.0 - slippage)
+                                close_position(
+                                    exit_time=minute_ts,
+                                    fill=exit_fill,
+                                    raw_reference=raw,
+                                    exit_fee_rate=BACKTEST_TAKER_FEE,
+                                    exit_slippage_per_unit=raw - exit_fill,
+                                    reason="stop_loss",
+                                )
+                                closed_this_hour = True
+                                break
+
+                            # No usamos el high del minuto del fill LIMIT para
+                            # MFE/TP porque no conocemos el orden intrabar.
+                            position.max_adverse_distance = max(
+                                position.max_adverse_distance,
+                                max(0.0, position.entry_price - low),
+                            )
+                            continue
+
+                        if process_bar(minute_ts, minute_row):
+                            closed_this_hour = True
+                            break
 
         equity = wallet
         if position is not None:
-            equity += _unrealized_pnl(position, float(bar["close"]))
+            equity += (float(row["close"]) - position.entry_price) * position.amount
         equity_values.append(equity)
-        equity_index.append(timestamp)
+        equity_index.append(ts)
 
     if not equity_values:
-        equity_values = [float(initial_capital)]
+        equity_values = [float(INITIAL_CAPITAL)]
         equity_index = [signals.index[0]]
 
-    equity_curve = pd.Series(equity_values, index=equity_index, name="equity")
-    final_equity = float(equity_curve.iloc[-1])
-    total_return = final_equity / initial_capital - 1.0
-
+    equity_curve = pd.Series(equity_values, index=equity_index)
     running_max = equity_curve.cummax()
-    drawdown = equity_curve / running_max - 1.0
-    max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
+    max_dd = float((equity_curve / running_max - 1.0).min())
+    trade_df = pd.DataFrame([asdict(t) for t in trades])
 
-    returns = equity_curve.pct_change().dropna()
-    seconds_per_bar = pd.Timedelta(TIMEFRAME).total_seconds()
-    periods_per_year = max(1, int((365.0 * 24.0 * 3600.0) / seconds_per_bar))
-    sharpe = calculate_sharpe_ratio(returns, 0.0, periods_per_year)
-
-    trade_df = pd.DataFrame([asdict(trade) for trade in closed_trades])
-    return BacktestResult(
-        initial_capital=initial_capital,
-        final_equity=final_equity,
-        total_return=total_return,
-        max_drawdown=max_drawdown,
-        sharpe_ratio=sharpe,
+    return SimulationResult(
+        variant=variant.name,
+        risk_reward_ratio=risk_reward_ratio,
+        slippage_bps=market_slippage_bps,
+        initial_capital=INITIAL_CAPITAL,
+        final_equity=float(equity_curve.iloc[-1]),
+        total_return=float(equity_curve.iloc[-1] / INITIAL_CAPITAL - 1.0),
+        max_drawdown=max_dd,
+        attempted_signals=attempted,
+        filled_entries=filled_entries,
+        missed_entries=missed_entries,
+        maker_entries=maker_entries,
+        taker_entries=taker_entries,
         trades=trade_df,
-        equity_curve=equity_curve,
-        open_position=position,
     )
 
 
-def _profit_factor(trades: pd.DataFrame, column: str = "pnl") -> float:
-    if trades.empty or column not in trades.columns:
-        return float("nan")
-    gross_profit = trades.loc[trades[column] > 0, column].sum()
-    gross_loss = -trades.loc[trades[column] < 0, column].sum()
-    if gross_loss == 0:
-        return float("inf") if gross_profit > 0 else float("nan")
-    return float(gross_profit / gross_loss)
-
-
-def _safe_mean(series: pd.Series) -> float:
-    return float(series.mean()) if len(series) else float("nan")
-
-
-def _metrics_from_result(case: ResearchCase, result: BacktestResult) -> dict:
+def metrics(result: SimulationResult) -> dict[str, float | str | int]:
     trades = result.trades
-    count = len(trades)
+    n = len(trades)
     return {
-        "side_mode": case.side_mode,
-        "regime_mode": case.regime_mode,
-        "rr": case.risk_reward_ratio,
-        "execution_profile": case.execution_profile,
-        "slippage_bps": case.market_slippage_bps,
-        "trades": count,
-        "win_rate": float((trades["pnl"] > 0).mean()) if count else float("nan"),
-        "gross_pf": _profit_factor(trades, "gross_before_costs"),
+        "variant": result.variant,
+        "rr": result.risk_reward_ratio,
+        "slippage_bps": result.slippage_bps,
+        "attempted": result.attempted_signals,
+        "filled": result.filled_entries,
+        "missed": result.missed_entries,
+        "fill_rate": (
+            result.filled_entries / result.attempted_signals
+            if result.attempted_signals
+            else float("nan")
+        ),
+        "trades": n,
+        "maker_share": (result.maker_entries / result.filled_entries if result.filled_entries else float("nan")),
+        "taker_share": (result.taker_entries / result.filled_entries if result.filled_entries else float("nan")),
+        "avg_entry_delay_min": float(trades["entry_delay_minutes"].mean()) if n else float("nan"),
+        "win_rate": float((trades["pnl"] > 0).mean()) if n else float("nan"),
         "net_pf": _profit_factor(trades, "pnl"),
-        "gross_expectancy": _safe_mean(trades["gross_before_costs"]) if count else float("nan"),
-        "net_expectancy": _safe_mean(trades["pnl"]) if count else float("nan"),
-        "gross_pnl": float(trades["gross_before_costs"].sum()) if count else 0.0,
-        "net_pnl": float(trades["pnl"].sum()) if count else 0.0,
-        "fees": float(trades["fees"].sum()) if count else 0.0,
-        "slippage_cost": float(trades["slippage_cost"].sum()) if count else 0.0,
-        "gross_profit": float(trades.loc[trades["gross_before_costs"] > 0, "gross_before_costs"].sum()) if count else 0.0,
-        "gross_loss": float(-trades.loc[trades["gross_before_costs"] < 0, "gross_before_costs"].sum()) if count else 0.0,
-        "net_profit": float(trades.loc[trades["pnl"] > 0, "pnl"].sum()) if count else 0.0,
-        "net_loss": float(-trades.loc[trades["pnl"] < 0, "pnl"].sum()) if count else 0.0,
+        "gross_pf": _profit_factor(trades, "gross_before_costs"),
+        "net_expectancy": float(trades["pnl"].mean()) if n else float("nan"),
+        "net_pnl": float(trades["pnl"].sum()) if n else 0.0,
+        "fees": float(trades["fees"].sum()) if n else 0.0,
+        "slippage_cost": float(trades["slippage_cost"].sum()) if n else 0.0,
         "return": result.total_return,
         "max_dd": result.max_drawdown,
-        "mfe_median": float(trades["mfe_r"].median()) if count else float("nan"),
-        "mae_median": float(trades["mae_r"].median()) if count else float("nan"),
-        "holding_median_h": float(trades["holding_hours"].median()) if count else float("nan"),
+        "entry_improvement_bps": float(trades["entry_improvement_bps"].mean()) if n else float("nan"),
+        "holding_median_h": float(trades["holding_hours"].median()) if n else float("nan"),
     }
 
 
-def _format_pf(value: float) -> str:
-    if pd.isna(value):
-        return " n/a"
-    if math.isinf(value):
-        return " inf"
-    return f"{value:5.2f}"
-
-
-def _print_grid_summary(rows: list[dict]) -> None:
-    print("\n\n" + "=" * 138)
-    print("RESEARCH GRID V6 - ESTRATEGIA V5 FIJA + MODELO DE EJECUCION")
-    print("=" * 138)
-    print(
-        "profile     slip  RR   trades   win%  grossPF  netPF  grossExp  netExp  "
-        "fees    slipCost   return   maxDD"
+def _build_signals() -> pd.DataFrame:
+    print(f"Descargando 1h: {BACKTEST_START} -> {BACKTEST_END}")
+    df = fetch_binance_history(SYMBOL, TIMEFRAME, BACKTEST_START, BACKTEST_END)
+    print(f"Descargando {REGIME_TIMEFRAME} para regimen...")
+    regime_df = fetch_binance_history(
+        SYMBOL,
+        REGIME_TIMEFRAME,
+        BACKTEST_START,
+        BACKTEST_END,
     )
-    for row in rows:
-        print(
-            f"{row['execution_profile']:<11} {row['slippage_bps']:>4.1f}bp "
-            f"{row['rr']:>4.2f} {row['trades']:>7} {row['win_rate']:>6.1%} "
-            f"{_format_pf(row['gross_pf']):>7} {_format_pf(row['net_pf']):>6} "
-            f"{row['gross_expectancy']:>8.3f} {row['net_expectancy']:>7.3f} "
-            f"{row['fees']:>7.1f} {row['slippage_cost']:>10.1f} "
-            f"{row['return']:>8.2%} {row['max_dd']:>7.2%}"
-        )
 
+    min_rows = max(TREND_WINDOW, LOOKBACK_WINDOW, ATR_WINDOW) + 50
+    if len(df) < min_rows:
+        raise RuntimeError(f"Historia 1h insuficiente: {len(df)} velas")
+    if len(regime_df) < REGIME_EMA_WINDOW + REGIME_SLOPE_LOOKBACK + 20:
+        raise RuntimeError(f"Historia {REGIME_TIMEFRAME} insuficiente")
 
-def _estimate_break_even_bps(group: pd.DataFrame) -> str:
-    work = group.sort_values("slippage_bps")
-    points = list(zip(work["slippage_bps"].astype(float), work["net_pf"].astype(float)))
-    if not points:
-        return "n/a"
-    if points[0][1] < 1.0:
-        return "<min"
-    if points[-1][1] >= 1.0:
-        return f">={points[-1][0]:.1f}"
-    for (x1, y1), (x2, y2) in zip(points, points[1:]):
-        if y1 >= 1.0 and y2 < 1.0:
-            if y1 == y2:
-                return f"{x1:.1f}-{x2:.1f}"
-            x = x1 + (1.0 - y1) * (x2 - x1) / (y2 - y1)
-            return f"~{x:.2f}"
-    return "n/a"
-
-
-def _print_break_even_summary(rows: list[dict]) -> None:
-    df = pd.DataFrame(rows)
-    print("\nSLIPPAGE DE BREAK-EVEN APROX. (NET PF = 1)")
-    print("profile      RR   break-even bps   PF@0bp   PF@5bp")
-    for (profile, rr), group in df.groupby(["execution_profile", "rr"], sort=False):
-        zero = group.loc[group["slippage_bps"] == group["slippage_bps"].min(), "net_pf"]
-        maxs = group.loc[group["slippage_bps"] == group["slippage_bps"].max(), "net_pf"]
-        pf0 = float(zero.iloc[0]) if len(zero) else float("nan")
-        pfm = float(maxs.iloc[0]) if len(maxs) else float("nan")
-        print(
-            f"{profile:<12} {rr:>4.2f} {_estimate_break_even_bps(group):>16} "
-            f"{_format_pf(pf0):>7} {_format_pf(pfm):>7}"
-        )
-
-
-def _annual_records(case: ResearchCase, result: BacktestResult) -> list[dict]:
-    trades = result.trades
-    if trades.empty:
-        return []
-    work = trades.copy()
-    work["entry_time"] = pd.to_datetime(work["entry_time"], utc=True)
-    work["year"] = work["entry_time"].dt.year
-    records: list[dict] = []
-    for year, group in work.groupby("year"):
-        records.append(
-            {
-                "side_mode": case.side_mode,
-                "regime_mode": case.regime_mode,
-                "rr": case.risk_reward_ratio,
-                "execution_profile": case.execution_profile,
-                "slippage_bps": case.market_slippage_bps,
-                "year": int(year),
-                "trades": len(group),
-                "gross_pf": _profit_factor(group, "gross_before_costs"),
-                "net_pf": _profit_factor(group, "pnl"),
-                "gross_expectancy": _safe_mean(group["gross_before_costs"]),
-                "net_expectancy": _safe_mean(group["pnl"]),
-                "gross_pnl": float(group["gross_before_costs"].sum()),
-                "net_pnl": float(group["pnl"].sum()),
-                "win_rate": float((group["pnl"] > 0).mean()),
-            }
-        )
-    return records
-
-
-def _print_yearly_cost_pivots(records: list[dict]) -> None:
-    df = pd.DataFrame(records)
-    if df.empty:
-        return
-    print("\nNET PROFIT FACTOR POR ANO Y SLIPPAGE")
-    for profile in BACKTEST_EXECUTION_PROFILES:
-        for rr in BACKTEST_TP_RATIOS:
-            subset = df[
-                (df["execution_profile"] == profile)
-                & (df["rr"] == float(rr))
-            ]
-            if subset.empty:
-                continue
-            pivot = subset.pivot(
-                index="year",
-                columns="slippage_bps",
-                values="net_pf",
-            ).sort_index()
-            print(f"\n[{profile} | RR={rr:.2f}]")
-            print(pivot.to_string(float_format=lambda x: f"{x:6.3f}"))
-
-
-def _side_flags(mode: str) -> tuple[bool, bool]:
-    if mode == "both":
-        return True, True
-    if mode == "long":
-        return True, False
-    if mode == "short":
-        return False, True
-    raise ValueError(f"Modo de lado no valido: {mode}")
-
-
-def _build_signals(
-    df: pd.DataFrame,
-    regime_mode: str,
-    regime_df: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
     strategy = MeanReversionStrategy(
         window=LOOKBACK_WINDOW,
         z_threshold=Z_THRESHOLD,
         trend_window=TREND_WINDOW,
         atr_window=ATR_WINDOW,
-        entry_mode="confirmed",
-        mean_exit_z=MEAN_EXIT_Z,
-        regime_mode=regime_mode,
+        entry_mode=ENTRY_MODE,
+        regime_mode=REGIME_MODE,
         signal_timeframe=TIMEFRAME,
         regime_timeframe=REGIME_TIMEFRAME,
         regime_ema_window=REGIME_EMA_WINDOW,
@@ -819,253 +813,208 @@ def _build_signals(
     return strategy.calculate_signals(df, regime_df=regime_df)
 
 
-def _risk_manager(rr: float) -> RiskManager:
-    return RiskManager(
-        risk_per_trade=RISK_PER_TRADE,
-        max_position_pct=MAX_POSITION_PCT,
-        atr_multiplier=ATR_MULTIPLIER,
-        risk_reward_ratio=rr,
-        cash_buffer_pct=CASH_BUFFER_PCT,
+def _print_summary(rows: list[dict]) -> None:
+    print("\n" + "=" * 184)
+    print(
+        "BACKTEST V8 FINAL | LONG confirmed + 1h SMA200 AND 4h EMA200 | "
+        "TP maker | baseline vs pullback/no-chase"
     )
-
-
-def _execution_model(case: ResearchCase) -> ExecutionModel:
-    return ExecutionModel(
-        profile=case.execution_profile,
-        taker_fee=BACKTEST_TAKER_FEE,
-        maker_fee=BACKTEST_MAKER_FEE,
-        market_slippage=case.market_slippage_bps / 10_000.0,
+    print("=" * 184)
+    print(
+        "variant          RR  slip attempts fill% maker% delay trades win% "
+        "grossPF netPF  netExp entryImp fees  slipCost return   maxDD"
     )
+    for r in rows:
+        print(
+            f"{r['variant']:<16} {r['rr']:>3.1f} {r['slippage_bps']:>4.1f}bp "
+            f"{r['attempted']:>8} {r['fill_rate']:>5.1%} {r['maker_share']:>6.1%} "
+            f"{r['avg_entry_delay_min']:>5.2f}m {r['trades']:>6} "
+            f"{r['win_rate']:>5.1%} {r['gross_pf']:>7.3f} {r['net_pf']:>5.3f} "
+            f"{r['net_expectancy']:>7.3f} {r['entry_improvement_bps']:>8.2f}bp "
+            f"{r['fees']:>6.1f} {r['slippage_cost']:>8.1f} "
+            f"{r['return']:>7.2%} {r['max_dd']:>7.2%}"
+        )
 
 
-def _test_year_window(signals: pd.DataFrame, year: int) -> pd.DataFrame:
-    tz = signals.index.tz
-    start = pd.Timestamp(year=year, month=1, day=1, tz=tz)
-    # Una vela previa basta porque los indicadores ya estan calculados sobre el
-    # dataset completo. Dejamos disponible todo el futuro: simulate() deja de
-    # recorrer en cuanto acaba el ano y ya no queda posicion abierta. Asi una
-    # posicion del 31 de diciembre puede cerrarse correctamente sin un corte
-    # arbitrario de dias.
-    bar_delta = pd.Timedelta(TIMEFRAME)
-    return signals.loc[signals.index >= start - bar_delta]
-
-
-def _walk_forward_records(
-    signals_by_regime: dict[str, pd.DataFrame],
-    cases: list[ResearchCase],
-) -> list[dict]:
-    if not signals_by_regime:
-        return []
-    reference_signals = next(iter(signals_by_regime.values()))
-    if reference_signals.empty:
-        return []
-    years = sorted(set(int(year) for year in reference_signals.index.year))
-    if len(years) <= BACKTEST_WALK_FORWARD_MIN_TRAIN_YEARS:
-        return []
-
-    test_years = years[BACKTEST_WALK_FORWARD_MIN_TRAIN_YEARS:]
+def _annual_rows(signals: pd.DataFrame, minute_cache: pd.DataFrame) -> list[dict]:
+    years = sorted(set(int(y) for y in signals.index.year))
+    # Criterio temporal V8 final: primeros 2 anos como historia previa.
+    test_years = years[2:]
     records: list[dict] = []
-    tz = reference_signals.index.tz
+    tz = signals.index.tz
 
-    for case in cases:
-        risk = _risk_manager(case.risk_reward_ratio)
-        case_signals = signals_by_regime[case.regime_mode]
-        for year in test_years:
-            year_signals = _test_year_window(case_signals, year)
-            if len(year_signals) < 2:
-                continue
-            entry_start = pd.Timestamp(year=year, month=1, day=1, tz=tz)
-            entry_end = pd.Timestamp(
-                year=year,
-                month=12,
-                day=31,
-                hour=23,
-                minute=59,
-                second=59,
-                tz=tz,
-            )
-            result = simulate(
-                year_signals,
-                risk,
-                exit_mode="fixed_rr",
-                risk_reward_ratio=case.risk_reward_ratio,
-                allow_longs=case.allow_longs,
-                allow_shorts=case.allow_shorts,
-                execution_model=_execution_model(case),
-                entry_start=entry_start,
-                entry_end=entry_end,
-            )
-            row = _metrics_from_result(case, result)
-            row["test_year"] = year
-            row["train_through"] = year - 1
-            records.append(row)
+    for variant in ENTRY_VARIANTS:
+        for rr in RR_GRID:
+            for slip in MARKET_SLIPPAGE_BPS:
+                for year in test_years:
+                    start = pd.Timestamp(year=year, month=1, day=1, tz=tz)
+                    end = pd.Timestamp(
+                        year=year,
+                        month=12,
+                        day=31,
+                        hour=23,
+                        minute=59,
+                        second=59,
+                        tz=tz,
+                    )
+                    result = simulate_variant(
+                        signals,
+                        minute_cache,
+                        variant,
+                        slip,
+                        rr,
+                        entry_start=start,
+                        entry_end=end,
+                    )
+                    row = metrics(result)
+                    row["year"] = year
+                    records.append(row)
     return records
 
 
-def _print_walk_forward(records: list[dict]) -> None:
+def _print_annual(records: list[dict]) -> None:
     df = pd.DataFrame(records)
     if df.empty:
-        print("\nSin anos suficientes para validacion temporal.")
         return
-
-    print("\n\n" + "=" * 138)
-    print("VALIDACION TEMPORAL ANUAL V6 - PARAMETROS DE ESTRATEGIA FIJOS")
-    print("=" * 138)
-    print(
-        "profile     slip  RR   years  +years  aggNetPF  medianPF  "
-        "aggNetPnL  avgNetExp  worstRet"
-    )
-
-    group_cols = ["execution_profile", "slippage_bps", "rr"]
-    for (profile, slip_bps, rr), group in df.groupby(group_cols, sort=False):
-        trades = int(group["trades"].sum())
-        positive_years = int((group["net_pnl"] > 0).sum())
-        finite_pf = group["net_pf"].replace([np.inf, -np.inf], np.nan).dropna()
-        median_pf = float(finite_pf.median()) if len(finite_pf) else float("nan")
-        agg_net_pnl = float(group["net_pnl"].sum())
-        avg_net_exp = agg_net_pnl / trades if trades > 0 else float("nan")
-        agg_profit = float(group["net_profit"].sum())
-        agg_loss = float(group["net_loss"].sum())
-        if agg_loss > 0:
-            agg_pf = agg_profit / agg_loss
-        elif agg_profit > 0:
-            agg_pf = float("inf")
-        else:
-            agg_pf = float("nan")
-
-        print(
-            f"{profile:<11} {slip_bps:>4.1f}bp {rr:>4.2f} {len(group):>6} "
-            f"{positive_years:>7} {_format_pf(agg_pf):>8} "
-            f"{_format_pf(median_pf):>8} {agg_net_pnl:>10.2f} "
-            f"{avg_net_exp:>10.3f} {group['return'].min():>8.2%}"
-        )
-
-    print("\nNET PF POR ANO DE TEST (columnas = slippage bps)")
-    for profile in BACKTEST_EXECUTION_PROFILES:
-        for rr in BACKTEST_TP_RATIOS:
+    print("\nNET PF POR ANO DE TEST (V8 FINAL)")
+    for slip in MARKET_SLIPPAGE_BPS:
+        for rr in RR_GRID:
+            print(f"\n[market slippage={slip:.1f} bp | RR={rr:.2f}]")
             subset = df[
-                (df["execution_profile"] == profile)
-                & (df["rr"] == float(rr))
+                (df["slippage_bps"] == slip)
+                & (df["rr"] == rr)
             ]
-            if subset.empty:
-                continue
             pivot = subset.pivot(
-                index="test_year",
-                columns="slippage_bps",
+                index="year",
+                columns="variant",
                 values="net_pf",
-            ).sort_index()
-            print(f"\n[{profile} | RR={rr:.2f}]")
+            )
             print(pivot.to_string(float_format=lambda x: f"{x:6.3f}"))
 
 
-def run_backtest() -> None:
+def _print_robustness(summary_rows: list[dict], annual_records: list[dict]) -> None:
+    summary = pd.DataFrame(summary_rows)
+    annual = pd.DataFrame(annual_records)
+    if summary.empty or annual.empty:
+        return
+
+    target_slip = min(MARKET_SLIPPAGE_BPS, key=lambda x: abs(x - 2.0))
+    s2 = summary[summary["slippage_bps"] == target_slip].copy()
+    a2 = annual[annual["slippage_bps"] == target_slip].copy()
+    yearly = (
+        a2.groupby(["variant", "rr"], as_index=False)
+        .agg(
+            worst_year_pf=("net_pf", "min"),
+            median_year_pf=("net_pf", "median"),
+            positive_years=("net_pnl", lambda x: int((x > 0).sum())),
+            years=("year", "nunique"),
+        )
+    )
+    table = s2.merge(yearly, on=["variant", "rr"], how="left")
+    table = table.sort_values(
+        ["positive_years", "worst_year_pf", "net_pf"],
+        ascending=[False, False, False],
+    )
+
+    print(
+        f"\nROBUSTEZ @ {target_slip:.1f} bp "
+        "(orden: anos positivos, peor PF anual, PF global)"
+    )
+    print(
+        "variant          RR  netPF return  maxDD fill% maker% +years "
+        "worstPF medianPF"
+    )
+    for _, r in table.iterrows():
+        print(
+            f"{r['variant']:<16} {r['rr']:>3.1f} {r['net_pf']:>5.3f} "
+            f"{r['return']:>6.2%} {r['max_dd']:>6.2%} {r['fill_rate']:>5.1%} "
+            f"{r['maker_share']:>6.1%} {int(r['positive_years']):>2}/{int(r['years']):<2} "
+            f"{r['worst_year_pf']:>7.3f} {r['median_year_pf']:>8.3f}"
+        )
+
+
+def _validate_frozen_v8() -> None:
     validate_settings()
+    if ENTRY_MODE != "confirmed":
+        raise RuntimeError("V8 final requiere ENTRY_MODE=confirmed.")
+    if REGIME_MODE != "1h_sma200_4h_ema200":
+        raise RuntimeError(
+            "V8 final requiere REGIME_MODE=1h_sma200_4h_ema200."
+        )
+    if TAKE_PROFIT_ORDER_MODE != "maker_limit":
+        raise RuntimeError("V8 final requiere TAKE_PROFIT_ORDER_MODE=maker_limit.")
+
+
+def run() -> None:
+    _validate_frozen_v8()
+    print("Backtest V8 FINAL: baseline MARKET vs pullback LIMIT/no-chase.")
     print(
-        f"Descargando Binance USD-M Futures {SYMBOL} {TIMEFRAME}: "
-        f"{BACKTEST_START} -> {BACKTEST_END}..."
+        f"Estrategia: LONG confirmed | regimen={REGIME_MODE} | "
+        f"ATR x{ATR_MULTIPLIER:.2f}"
     )
     print(
-        "V6: estrategia congelada = LONG confirmed + 1h SMA200 AND 4h EMA200. "
-        "Se varia solo RR, perfil de ejecucion y slippage de mercado."
+        f"V8 final: LIMIT -{ENTRY_LIMIT_OFFSET_BPS:.1f}bp desde signal close | "
+        f"wait={ENTRY_LIMIT_WAIT_SECONDS // 60}m | "
+        f"fallback cap=+{ENTRY_FALLBACK_CAP_BPS:.1f}bp vs t=0"
     )
     print(
-        f"Fees investigacion: taker={BACKTEST_TAKER_FEE:.6f} | "
+        f"Fees: taker={BACKTEST_TAKER_FEE:.6f} | "
         f"maker={BACKTEST_MAKER_FEE:.6f}"
     )
-    print(f"RR grid: {BACKTEST_TP_RATIOS}")
-    print(f"Execution profiles: {BACKTEST_EXECUTION_PROFILES}")
-    print(f"Market slippage grid (bps): {BACKTEST_MARKET_SLIPPAGE_BPS}")
-    print(f"Regime fijo: {BACKTEST_V6_REGIME_MODE}")
+    print(f"RR grid: {RR_GRID}")
+    print(f"Market slippage grid: {MARKET_SLIPPAGE_BPS} bp")
+    print(f"Entry modes: {tuple(v.name for v in ENTRY_VARIANTS)}")
     print(
-        "Nota maker_tp: el TP se modela como LIMIT maker sin slippage al tocar el "
-        "precio. OHLC no permite modelar cola, partial fills ni missed fills."
+        "Modelo LIMIT conservador: debe poder descansar postOnly en t=0 y "
+        "el low debe atravesar el limite. TP no se evalua en el mismo minuto "
+        "del fill LIMIT."
     )
 
-    df = fetch_binance_history(
-        symbol=SYMBOL,
-        timeframe=TIMEFRAME,
-        start=BACKTEST_START,
-        end=BACKTEST_END,
-    )
+    signals = _build_signals()
+    minute_cache = ensure_minute_cache(signals)
 
-    min_rows = max(TREND_WINDOW, LOOKBACK_WINDOW, ATR_WINDOW) + 50
-    if len(df) < min_rows:
-        raise RuntimeError(
-            f"Solo hay {len(df)} velas; se necesitan al menos {min_rows}."
-        )
-
-    regime_df = None
-    if BACKTEST_V6_REGIME_MODE != "1h_sma200":
-        print(
-            f"Descargando regimen Binance USD-M Futures {SYMBOL} "
-            f"{REGIME_TIMEFRAME}: {BACKTEST_START} -> {BACKTEST_END}..."
-        )
-        regime_df = fetch_binance_history(
-            symbol=SYMBOL,
-            timeframe=REGIME_TIMEFRAME,
-            start=BACKTEST_START,
-            end=BACKTEST_END,
-        )
-        min_regime_rows = REGIME_EMA_WINDOW + REGIME_SLOPE_LOOKBACK + 20
-        if len(regime_df) < min_regime_rows:
-            raise RuntimeError(
-                f"Solo hay {len(regime_df)} velas {REGIME_TIMEFRAME}; "
-                f"se necesitan al menos {min_regime_rows}."
-            )
-
-    signals = _build_signals(
-        df,
-        regime_mode=BACKTEST_V6_REGIME_MODE,
-        regime_df=regime_df,
-    )
-    signals_by_regime = {BACKTEST_V6_REGIME_MODE: signals}
-
-    cases: list[ResearchCase] = []
-    summary_rows: list[dict] = []
-    annual_rows: list[dict] = []
-
-    for profile in BACKTEST_EXECUTION_PROFILES:
-        for slippage_bps in BACKTEST_MARKET_SLIPPAGE_BPS:
-            for rr in BACKTEST_TP_RATIOS:
-                case = ResearchCase(
-                    side_mode="long",
-                    regime_mode=BACKTEST_V6_REGIME_MODE,
-                    risk_reward_ratio=float(rr),
-                    allow_longs=True,
-                    allow_shorts=False,
-                    execution_profile=profile,
-                    market_slippage_bps=float(slippage_bps),
-                )
-                cases.append(case)
-                result = simulate(
+    rows: list[dict] = []
+    trade_frames: list[pd.DataFrame] = []
+    for variant in ENTRY_VARIANTS:
+        for rr in RR_GRID:
+            for slip in MARKET_SLIPPAGE_BPS:
+                result = simulate_variant(
                     signals,
-                    _risk_manager(case.risk_reward_ratio),
-                    exit_mode="fixed_rr",
-                    risk_reward_ratio=case.risk_reward_ratio,
-                    allow_longs=True,
-                    allow_shorts=False,
-                    execution_model=_execution_model(case),
+                    minute_cache,
+                    variant,
+                    slip,
+                    rr,
                 )
-                summary_rows.append(_metrics_from_result(case, result))
-                if BACKTEST_YEARLY_BREAKDOWN:
-                    annual_rows.extend(_annual_records(case, result))
+                rows.append(metrics(result))
+                if not result.trades.empty:
+                    detail = result.trades.copy()
+                    detail.insert(0, "slippage_bps", slip)
+                    detail.insert(0, "rr", rr)
+                    detail.insert(0, "variant", variant.name)
+                    trade_frames.append(detail)
 
-    _print_grid_summary(summary_rows)
-    _print_break_even_summary(summary_rows)
+    _print_summary(rows)
+    SUMMARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(SUMMARY_FILE, index=False)
+    print(f"\nResumen guardado en {SUMMARY_FILE}")
 
-    if BACKTEST_YEARLY_BREAKDOWN:
-        _print_yearly_cost_pivots(annual_rows)
+    if trade_frames:
+        TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        pd.concat(trade_frames, ignore_index=True).to_csv(TRADES_FILE, index=False)
+        print(f"Detalle de trades guardado en {TRADES_FILE}")
 
-    if BACKTEST_WALK_FORWARD:
-        wf_rows = _walk_forward_records(signals_by_regime, cases)
-        _print_walk_forward(wf_rows)
+    annual = _annual_rows(signals, minute_cache)
+    ANNUAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(annual).to_csv(ANNUAL_FILE, index=False)
+    _print_annual(annual)
+    _print_robustness(rows, annual)
+    print(f"\nDetalle anual guardado en {ANNUAL_FILE}")
 
-    print("\n\nReferencia live actual: NO se modifica automaticamente por V6.")
     print(
-        f"REGIME_MODE={REGIME_MODE if 'REGIME_MODE' in globals() else 'config'} | "
-        f"RISK_REWARD_RATIO={RISK_REWARD_RATIO:.2f}"
+        "\nCriterio final: no elegir RR por PF global aislado. Para cambiar "
+        "RR=1.5 se exige mantener estabilidad anual, peor ano y DD con la entrada V8 final."
     )
 
 
 if __name__ == "__main__":
-    run_backtest()
+    run()

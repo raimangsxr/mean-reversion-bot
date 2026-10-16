@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   trading-bot:
     build: .
@@ -8,7 +6,7 @@ services:
     env_file:
       - .env
     volumes:
-      - .:/app  # Opcional: útil para desarrollo si quieres mapear cambios en caliente
+      - ./state:/app/state
     logging:
       driver: "json-file"
       options:
