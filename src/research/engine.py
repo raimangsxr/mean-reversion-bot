@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+import hashlib
 import json
 import math
 import re
@@ -48,6 +49,7 @@ from config.settings import (
     TIMEFRAME,
     TREND_WINDOW,
     Z_THRESHOLD,
+    V10_2_FUNDING_MAX_GAP_HOURS,
 )
 from src.risk.manager import RiskManager
 from src.strategy.mean_reversion import MeanReversionStrategy
@@ -285,11 +287,11 @@ def parse_exit_profile(name: str, rr: float) -> ExitPolicy:
     if value == "hybrid_rr_mean_time24":
         return ExitPolicy(value, rr, mean_exit=True, time_stop_hours=24)
 
-    raise ValueError(f"Perfil de salida V9 desconocido: {name}")
+    raise ValueError(f"Perfil de salida V10.2 desconocido: {name}")
 
 
 # -----------------------------------------------------------------------------
-# Entrada V9 congelada y generalizada simetricamente a LONG/SHORT.
+# Entrada V10.2 congelada y generalizada simetricamente a LONG/SHORT.
 # -----------------------------------------------------------------------------
 def resolve_entry(
     minute_hour: pd.DataFrame,
@@ -481,8 +483,13 @@ def ensure_minute_cache(symbol: str, signals: pd.DataFrame, include_shorts: bool
     return cache
 
 
+def _funding_paths(symbol: str) -> tuple[Path, Path]:
+    base = Path(BACKTEST_FUNDING_CACHE_DIR) / _slug(symbol)
+    return base.with_suffix(".csv"), base.with_suffix(".meta.json")
+
+
 def load_funding_cache(symbol: str) -> pd.DataFrame:
-    path = Path(BACKTEST_FUNDING_CACHE_DIR) / f"{_slug(symbol)}.csv"
+    path, _ = _funding_paths(symbol)
     if not path.exists():
         return pd.DataFrame(
             columns=["funding_rate"],
@@ -503,47 +510,89 @@ def load_funding_cache(symbol: str) -> pd.DataFrame:
     )
 
 
-def ensure_funding_cache(symbol: str, start: str, end: str) -> pd.DataFrame:
-    cache = load_funding_cache(symbol)
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
-    if start_ts.tzinfo is None:
-        start_ts = start_ts.tz_localize("UTC")
-    if end_ts.tzinfo is None:
-        end_ts = end_ts.tz_localize("UTC")
+def _funding_sha256(cache: pd.DataFrame) -> str:
+    h = hashlib.sha256()
+    if cache.empty:
+        return h.hexdigest()
+    clean = cache.sort_index()
+    for ts, rate in zip(clean.index, clean["funding_rate"].astype(float), strict=True):
+        stamp = pd.Timestamp(ts).tz_convert("UTC").isoformat()
+        h.update(f"{stamp},{float(rate):.17g}\n".encode("utf-8"))
+    return h.hexdigest()
 
-    covered = (
-        not cache.empty
-        and cache.index.min() <= start_ts + pd.Timedelta(hours=8)
-        and cache.index.max() >= end_ts - pd.Timedelta(hours=8)
-    )
-    if covered:
-        return cache.loc[(cache.index >= start_ts) & (cache.index < end_ts)]
 
+def funding_snapshot_info(symbol: str, cache: pd.DataFrame | None = None) -> dict:
+    cache = load_funding_cache(symbol) if cache is None else cache.sort_index()
+    return {
+        "schema": 1,
+        "symbol": symbol,
+        "rows": int(len(cache)),
+        "first": cache.index.min().isoformat() if not cache.empty else None,
+        "last": cache.index.max().isoformat() if not cache.empty else None,
+        "values_sha256": _funding_sha256(cache),
+    }
+
+
+def _write_funding_snapshot(symbol: str, cache: pd.DataFrame) -> dict:
+    path, meta_path = _funding_paths(symbol)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cache = cache.sort_index().copy()
+    cache.index.name = "timestamp"
+    cache.reset_index().to_csv(path, index=False)
+    info = funding_snapshot_info(symbol, cache)
+    meta_path.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    return info
+
+
+def _verify_funding_snapshot(symbol: str, cache: pd.DataFrame) -> dict:
+    _, meta_path = _funding_paths(symbol)
+    if not meta_path.exists():
+        raise RuntimeError(
+            f"Cache funding legacy para {symbol}: falta snapshot metadata. "
+            "Ejecuta backtest_v10_2.py --rebuild-funding una vez."
+        )
+    try:
+        expected = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Metadata funding invalida para {symbol}: {exc}") from exc
+    actual = funding_snapshot_info(symbol, cache)
+    for key in ("symbol", "rows", "first", "last", "values_sha256"):
+        if expected.get(key) != actual.get(key):
+            raise RuntimeError(
+                f"Snapshot funding alterado para {symbol}: {key} no coincide. "
+                "Usa --rebuild-funding solo si quieres crear deliberadamente un nuevo snapshot."
+            )
+    return actual
+
+
+def _fetch_funding_range(symbol: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
     if ccxt is None:
         if BACKTEST_REQUIRE_FUNDING:
             raise RuntimeError("CCXT no esta instalado y funding es obligatorio.")
-        return cache
+        return pd.DataFrame(
+            columns=["funding_rate"],
+            index=pd.DatetimeIndex([], tz="UTC", name="timestamp"),
+        )
 
     exchange = _public_exchange()
-    since = int(start_ts.timestamp() * 1000)
+    cursor = int(start_ts.timestamp() * 1000)
     end_ms = int(end_ts.timestamp() * 1000)
     records: list[dict] = []
-    cursor = since
     while cursor < end_ms:
         batch = exchange.fetch_funding_rate_history(symbol, since=cursor, limit=1000)
         if not batch:
             break
         progressed = False
         for item in batch:
-            ts = item.get("timestamp")
+            raw_ts = item.get("timestamp")
             rate = item.get("fundingRate")
-            if ts is None or rate is None:
+            if raw_ts is None or rate is None:
                 continue
-            ts = int(ts)
+            ts = int(raw_ts)
             if ts >= end_ms:
                 continue
-            records.append({"timestamp": ts, "funding_rate": float(rate)})
+            if ts >= int(start_ts.timestamp() * 1000):
+                records.append({"timestamp": ts, "funding_rate": float(rate)})
             if ts >= cursor:
                 cursor = ts + 1
                 progressed = True
@@ -552,15 +601,105 @@ def ensure_funding_cache(symbol: str, start: str, end: str) -> pd.DataFrame:
         if int(batch[-1].get("timestamp") or 0) >= end_ms:
             break
 
-    if records:
-        fresh = pd.DataFrame(records)
-        fresh["timestamp"] = pd.to_datetime(fresh["timestamp"], unit="ms", utc=True)
-        fresh = fresh.set_index("timestamp")
-        cache = pd.concat([cache, fresh]).sort_index()
-        cache = cache[~cache.index.duplicated(keep="last")]
-        path = Path(BACKTEST_FUNDING_CACHE_DIR) / f"{_slug(symbol)}.csv"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        cache.reset_index().to_csv(path, index=False)
+    if not records:
+        return pd.DataFrame(
+            columns=["funding_rate"],
+            index=pd.DatetimeIndex([], tz="UTC", name="timestamp"),
+        )
+    fresh = pd.DataFrame(records)
+    fresh["timestamp"] = pd.to_datetime(fresh["timestamp"], unit="ms", utc=True)
+    return (
+        fresh.drop_duplicates(subset="timestamp", keep="last")
+        .sort_values("timestamp")
+        .set_index("timestamp")[["funding_rate"]]
+    )
+
+
+def _assert_funding_continuity(cache: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> None:
+    sliced = cache.loc[(cache.index >= start_ts) & (cache.index < end_ts)]
+    if sliced.empty:
+        if BACKTEST_REQUIRE_FUNDING:
+            raise RuntimeError("Funding snapshot vacio en el rango solicitado.")
+        return
+    if len(sliced) < 2:
+        return
+    gaps = sliced.index.to_series().diff().dropna().dt.total_seconds() / 3600.0
+    max_gap = float(gaps.max()) if not gaps.empty else 0.0
+    if max_gap > V10_2_FUNDING_MAX_GAP_HOURS:
+        raise RuntimeError(
+            f"Funding snapshot tiene un hueco de {max_gap:.1f}h (> "
+            f"{V10_2_FUNDING_MAX_GAP_HOURS:g}h). Reconstruye con --rebuild-funding."
+        )
+
+
+def ensure_funding_cache(
+    symbol: str,
+    start: str,
+    end: str,
+    *,
+    rebuild: bool = False,
+) -> pd.DataFrame:
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    if start_ts.tzinfo is None:
+        start_ts = start_ts.tz_localize("UTC")
+    else:
+        start_ts = start_ts.tz_convert("UTC")
+    if end_ts.tzinfo is None:
+        end_ts = end_ts.tz_localize("UTC")
+    else:
+        end_ts = end_ts.tz_convert("UTC")
+    if end_ts <= start_ts:
+        raise ValueError("Rango funding invalido")
+
+    cache = load_funding_cache(symbol)
+    _, meta_path = _funding_paths(symbol)
+
+    if rebuild:
+        cache = _fetch_funding_range(symbol, start_ts, end_ts)
+        if BACKTEST_REQUIRE_FUNDING and cache.empty:
+            raise RuntimeError(f"No se obtuvo funding historico para {symbol}.")
+        _assert_funding_continuity(cache, start_ts, end_ts)
+        _write_funding_snapshot(symbol, cache)
+        return cache.loc[(cache.index >= start_ts) & (cache.index < end_ts)]
+
+    if cache.empty:
+        cache = _fetch_funding_range(symbol, start_ts, end_ts)
+        if BACKTEST_REQUIRE_FUNDING and cache.empty:
+            raise RuntimeError(f"No se obtuvo funding historico para {symbol}.")
+        _assert_funding_continuity(cache, start_ts, end_ts)
+        _write_funding_snapshot(symbol, cache)
+        return cache.loc[(cache.index >= start_ts) & (cache.index < end_ts)]
+
+    if not meta_path.exists():
+        _verify_funding_snapshot(symbol, cache)  # raises with migration guidance
+    _verify_funding_snapshot(symbol, cache)
+
+    changed = False
+    # Prefix extension is allowed only without overwriting existing timestamps.
+    if cache.index.min() > start_ts + pd.Timedelta(hours=8):
+        prefix = _fetch_funding_range(symbol, start_ts, cache.index.min())
+        if not prefix.empty:
+            cache = pd.concat([prefix, cache]).sort_index()
+            cache = cache[~cache.index.duplicated(keep="last")]
+            changed = True
+
+    # Append-only tail extension: historical rows in the snapshot remain immutable.
+    if cache.index.max() < end_ts - pd.Timedelta(hours=8):
+        tail_start = cache.index.max() + pd.Timedelta(milliseconds=1)
+        tail = _fetch_funding_range(symbol, tail_start, end_ts)
+        if not tail.empty:
+            existing = cache.copy()
+            cache = pd.concat([cache, tail]).sort_index()
+            cache = cache[~cache.index.duplicated(keep="first")]
+            # Existing rows must remain byte-equivalent in canonical funding content.
+            if _funding_sha256(cache.loc[existing.index]) != _funding_sha256(existing):
+                raise RuntimeError("Extension funding intento modificar filas historicas congeladas.")
+            changed = True
+
+    _assert_funding_continuity(cache, start_ts, end_ts)
+    if changed:
+        _write_funding_snapshot(symbol, cache)
 
     sliced = cache.loc[(cache.index >= start_ts) & (cache.index < end_ts)]
     if BACKTEST_REQUIRE_FUNDING and sliced.empty:
@@ -1030,7 +1169,7 @@ def simulate_trade_path(
             pending_break_even = False
 
     # Horas siguientes sobre arrays NumPy. Evita signals.loc[mask] + iterrows
-    # para cada trade, que era el principal hot path de V9.
+    # para cada trade, que era el principal hot path de V10.2.
     start_pos = int(arrays.index.searchsorted(entry_hour, side="right"))
     exited = False
     exit_time: Optional[pd.Timestamp] = None
@@ -1127,7 +1266,7 @@ def generate_opportunities(
 ) -> pd.DataFrame:
     """Generate independent unit opportunities.
 
-    V9 original imposed ``symbol_busy_until`` here. That was both slow and
+    V10.2 original imposed ``symbol_busy_until`` here. That was both slow and
     conceptually too early: whether a prior signal actually consumes the symbol
     depends on portfolio sizing/concurrency. We now generate every valid signal
     path independently and let ``simulate_portfolio`` enforce one live position

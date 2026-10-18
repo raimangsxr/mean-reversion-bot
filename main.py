@@ -267,7 +267,7 @@ def main() -> None:
         raise ValueError(f"EXIT_MODE={EXIT_MODE!r} no soportado: {sorted(VALID_EXIT_MODES)}")
 
     print(
-        "Mean-reversion V9 | Binance USD-M | "
+        "Mean-reversion V10.2 | Binance USD-M | "
         f"symbols={LIVE_SYMBOLS} {TIMEFRAME} | {LEVERAGE}x | exit={EXIT_MODE} | "
         f"RR={RISK_REWARD_RATIO:.2f} | risk/trade={RISK_PER_TRADE:.2%} | "
         f"maxpos={MAX_POSITION_PCT:.0%} | portfolio-risk={MAX_PORTFOLIO_RISK_PCT:.2%} | "
@@ -411,7 +411,7 @@ def main() -> None:
 
                         use_tp = EXIT_MODE in TP_EXIT_MODES
                         context = {
-                            "strategy_version": "v9",
+                            "strategy_version": "v10.2",
                             "signal_time": signal_ts,
                             "signal_close": float(latest["close"]),
                             "signal_z": float(latest.get("z_score", math.nan)),

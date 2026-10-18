@@ -2,7 +2,7 @@ import math
 
 import pandas as pd
 
-from src.research.v9 import (
+from src.research.engine import (
     EntryPolicy,
     ExitPolicy,
     PortfolioConfig,
@@ -23,7 +23,7 @@ def signal_frame(rows, start="2026-01-01T00:00:00Z"):
     return pd.DataFrame(rows, index=idx)
 
 
-def test_v9_long_entry_uses_signal_close_and_t0_no_chase():
+def test_long_entry_uses_signal_close_and_t0_no_chase():
     rows = []
     for i in range(8):
         open_price = 100.0 if i == 0 else 100.04
@@ -37,7 +37,7 @@ def test_v9_long_entry_uses_signal_close_and_t0_no_chase():
     assert math.isclose(fill.raw_price, 100.04)
 
 
-def test_v9_short_entry_is_symmetric():
+def test_short_entry_is_symmetric():
     rows = [
         {"open": 100.0, "high": 100.04, "low": 99.9, "close": 100.0, "volume": 1},
         {"open": 100.0, "high": 100.05, "low": 99.9, "close": 100.0, "volume": 1},
@@ -136,10 +136,6 @@ def test_walk_forward_period_excludes_trade_that_closes_after_end():
     assert result.final_equity == result.initial_capital
 
 
-def test_v9_configuration_grid_builds_without_non_parameter_iterables():
-    from backtest import _config_grid
-
-    configs = _config_grid()
-    assert configs
-    assert all(c.exit_policy for c in configs)
-    assert all(c.side_mode in {"long_only", "long_short"} for c in configs)
+def test_portfolio_config_name_is_deterministic_for_research_grid():
+    cfg = PortfolioConfig("fixed_rr", 1.8, 0.005, 0.30, "long_only")
+    assert cfg.name == "fixed_rr|rr=1.8|risk=0.0050|maxpos=0.30|long_only"

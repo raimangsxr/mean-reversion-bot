@@ -207,7 +207,7 @@ def fetch_binance_history_cached(
 
     The first call downloads the requested history. Later calls only request
     closed candles missing at the head/tail, avoiding six full-history downloads
-    on every V9 run (BTC/ETH/SOL x 1h/4h).
+    on every V10.2 run (BTC/ETH/SOL x 1h/4h).
     """
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
@@ -301,3 +301,157 @@ def fetch_binance_history_cached(
             f"Cache/history vacio para {symbol} {timeframe} entre {start} y {end}."
         )
     return sliced
+
+
+def fetch_binance_taker_history(
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    limit: int = 1500,
+) -> pd.DataFrame:
+    """Fetch raw USD-M klines including taker-buy base volume.
+
+    CCXT ``fetch_ohlcv`` intentionally normalizes away Binance-specific kline
+    fields. V10 needs taker-buy volume for one pre-registered order-flow signal,
+    so this research-only helper reads the public raw futures kline endpoint.
+    """
+    exchange = _make_public_futures_exchange()
+    market = exchange.market(symbol)
+    market_id = market.get("id")
+    if not market_id:
+        raise RuntimeError(f"No se pudo resolver market id para {symbol}")
+
+    since = exchange.parse8601(start)
+    end_ts = exchange.parse8601(end)
+    if since is None or end_ts is None or since >= end_ts:
+        raise ValueError("start/end taker deben ser fechas ISO-8601 validas y ordenadas")
+
+    timeframe_ms = exchange.parse_timeframe(timeframe) * 1000
+    cursor = int(since)
+    rows: list[dict] = []
+    method = getattr(exchange, "fapiPublicGetKlines", None)
+    if method is None:
+        method = getattr(exchange, "fapi_public_get_klines", None)
+    if method is None:
+        raise RuntimeError("La version de CCXT no expone Binance USD-M public klines")
+
+    while cursor < end_ts:
+        batch = method(
+            {
+                "symbol": market_id,
+                "interval": timeframe,
+                "startTime": cursor,
+                "endTime": int(end_ts - 1),
+                "limit": int(limit),
+            }
+        )
+        if not batch:
+            break
+        progressed = False
+        for item in batch:
+            if len(item) < 11:
+                continue
+            open_ms = int(item[0])
+            if open_ms >= end_ts:
+                continue
+            rows.append(
+                {
+                    "timestamp": open_ms,
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": float(item[5]),
+                    "taker_buy_base_volume": float(item[9]),
+                    "taker_buy_quote_volume": float(item[10]),
+                    "trades": int(item[8]),
+                }
+            )
+            if open_ms >= cursor:
+                cursor = open_ms + timeframe_ms
+                progressed = True
+        if not progressed:
+            break
+        if len(batch) < limit:
+            break
+
+    if not rows:
+        raise RuntimeError("Binance Futures no devolvio klines taker para el periodo solicitado.")
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = (
+        df.drop_duplicates(subset="timestamp", keep="last")
+        .sort_values("timestamp")
+        .set_index("timestamp")
+    )
+    return keep_closed_candles(df, timeframe)
+
+
+def fetch_binance_taker_history_cached(
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    cache_dir: str,
+    limit: int = 1500,
+) -> pd.DataFrame:
+    """Incremental cache for V10 taker-flow research fields."""
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    start_ts = start_ts.tz_localize("UTC") if start_ts.tzinfo is None else start_ts.tz_convert("UTC")
+    end_ts = end_ts.tz_localize("UTC") if end_ts.tzinfo is None else end_ts.tz_convert("UTC")
+    delta = timeframe_to_timedelta(timeframe)
+    cache_path = Path(cache_dir) / f"{_history_cache_slug(symbol)}_{_history_cache_slug(timeframe)}_taker.csv"
+    columns = [
+        "open", "high", "low", "close", "volume",
+        "taker_buy_base_volume", "taker_buy_quote_volume", "trades",
+    ]
+    cache = pd.DataFrame(columns=columns, index=pd.DatetimeIndex([], tz="UTC", name="timestamp"))
+    if cache_path.exists():
+        try:
+            raw = pd.read_csv(cache_path)
+            if not raw.empty and "timestamp" in raw.columns:
+                raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
+                cache = (
+                    raw.dropna(subset=["timestamp"])
+                    .drop_duplicates(subset="timestamp", keep="last")
+                    .sort_values("timestamp")
+                    .set_index("timestamp")
+                )
+        except pd.errors.EmptyDataError:
+            pass
+
+    pieces = [cache] if not cache.empty else []
+    if cache.empty:
+        pieces.append(
+            fetch_binance_taker_history(
+                symbol, timeframe, start_ts.isoformat(), end_ts.isoformat(), limit=limit
+            )
+        )
+    else:
+        first = cache.index.min()
+        last = cache.index.max()
+        if first > start_ts:
+            # V10 principal es BTC, por lo que el contrato existe desde el
+            # inicio configurado. Si se usa otro activo y el prefijo pre-listing
+            # esta vacio, el caller puede ajustar BACKTEST_START.
+            pieces.append(
+                fetch_binance_taker_history(
+                    symbol, timeframe, start_ts.isoformat(), first.isoformat(), limit=limit
+                )
+            )
+        next_start = last + delta
+        if next_start + delta <= end_ts:
+            pieces.append(
+                fetch_binance_taker_history(
+                    symbol, timeframe, next_start.isoformat(), end_ts.isoformat(), limit=limit
+                )
+            )
+
+    merged = pd.concat(pieces).sort_index() if pieces else cache
+    merged = merged[~merged.index.duplicated(keep="last")]
+    if not merged.empty:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.reset_index().to_csv(cache_path, index=False)
+    return merged.loc[(merged.index >= start_ts) & (merged.index < end_ts)]

@@ -313,7 +313,7 @@ def test_partial_pending_fill_cancels_remainder_and_installs_protection(tmp_path
     assert tp["params"]["postOnly"] is True
 
 
-def test_v9_separates_limit_and_fallback_references(tmp_path):
+def test_separates_limit_and_fallback_references(tmp_path):
     engine = make_engine(tmp_path)
     engine.get_position_state = lambda symbol: {
         "known": True,
@@ -334,7 +334,7 @@ def test_v9_separates_limit_and_fallback_references(tmp_path):
         stop_distance=2.0,
         risk_reward_ratio=1.5,
         use_take_profit=True,
-        signal_timestamp="signal-v9",
+        signal_timestamp="signal-current",
     )
 
     state = result["state"]
@@ -344,7 +344,7 @@ def test_v9_separates_limit_and_fallback_references(tmp_path):
     assert state.entry_order_kind == "limit"
 
 
-def test_v9_marketable_limit_enters_wait_only_instead_of_forcing_post_only(tmp_path):
+def test_marketable_limit_enters_wait_only_instead_of_forcing_post_only(tmp_path):
     engine = make_engine(tmp_path)
     engine.get_position_state = lambda symbol: {
         "known": True,

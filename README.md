@@ -1,111 +1,109 @@
-# mean-reversion-bot — V9.2
+# mean-reversion-bot - V10.2
 
-Bot BTC mean-reversion para Binance USD-M Futures. V9.2 congela las conclusiones de V9.1 y deja de retunear la estrategia por ano.
+V10.2 consolidates the repository around one live code path and one research experiment.
+Older research entrypoints and versioned modules have been removed.
 
-## Configuracion live/Demo V9.2
+## Live / Demo
 
-La variante promovida a Demo es estatica:
+The live trigger is intentionally unchanged while V10.2 is researched:
 
 - BTC/USDT:USDT, LONG only;
-- entrada confirmed z-score + 1h SMA200 + 4h EMA200;
-- LIMIT postOnly a 3 bp del signal close;
-- espera 7 minutos;
-- fallback MARKET solo si sigue dentro de +5 bp respecto a t=0;
-- SL = 1.5 ATR desde el fill real;
-- TP = fixed RR 1.8, LIMIT reduceOnly postOnly;
-- `RISK_PER_TRADE=0.005`;
-- `MAX_POSITION_PCT=0.30`;
-- isolated, leverage 2.
+- confirmed z-score re-entry: window 20, threshold 2.2;
+- regime: 1h SMA200 + 4h EMA200;
+- LIMIT postOnly at -3 bp from signal close, wait 7 minutes;
+- MARKET fallback only inside the +5 bp no-chase cap;
+- SL = 1.5 ATR from actual fill;
+- TP = fixed RR 1.8, reduceOnly maker LIMIT;
+- base risk/trade = 0.5%;
+- max position = 30% of equity;
+- isolated margin, leverage 2.
 
-Las variantes mean/BE/parciales/time-stop y SHORT siguen soportadas por el codigo de research/live, pero no forman parte del grid V9.2 por defecto porque V9.1 no demostro mejora frente a `fixed_rr + LONG`.
+V10.2 does **not** switch the live signal to the new confirmation candidate automatically.
 
-## Seleccion V9.2
+## V10.2 research question
 
-El objetivo es maximizar return sujeto a una frontera de robustez. Ya no se exige 5/5 anos positivos como condicion binaria.
+The trigger remains z-score. V10.2 asks whether a same-candle confirmation improves trade quality:
 
-Defaults:
+1. `zscore_only` - control;
+2. `zscore_and_shock1h` - primary hypothesis;
+3. `zscore_and_shock3h`;
+4. `zscore_and_vwap48h`;
+5. `zscore_and_taker`.
 
-- max DD <= 10%;
-- al menos 4 anos positivos;
-- peor PF anual >= 0.90;
-- peor return anual >= -1%;
-- PF global >= 1.20.
+The confirmation thresholds are frozen before this run:
 
-Dentro de esa frontera, gana el mayor return. Con los resultados V9.1 suministrados, este criterio selecciona:
+- shock 1h = 2.175 normalized-vol units;
+- shock 3h = 1.725;
+- VWAP48 deviation = 1.55 ATR;
+- taker exhaustion min shock = 0.925 ATR.
 
-`fixed_rr | RR=1.8 | risk=0.5% | max-position=30% | LONG only`.
+There is no threshold optimization in V10.2.
 
-El anchored walk-forward dinamico se conserva exclusivamente como diagnostico de retuning. No se usa para elegir ni cambiar automaticamente la configuracion live.
+### Important statistical status
 
-## Research principal
+The shock1h combination was discovered after inspecting 2022+ results. Therefore V10.2 reports 2022+ as **development/diagnostic data**, not as a fresh holdout. Even if historical metrics are excellent, `recommendation.json` always keeps `promotion_to_live=false`; a fresh forward test is required.
 
-Por defecto el research es BTC-only:
+## Funding reproducibility
 
-```dotenv
-BACKTEST_SYMBOLS=BTC/USDT:USDT
-BACKTEST_SELECTION_SYMBOLS=BTC/USDT:USDT
-BACKTEST_EXIT_PROFILES=fixed_rr
-BACKTEST_TP_RATIOS=1.5,1.8
-BACKTEST_MAX_POSITION_PCT_GRID=0.10,0.30,0.50,0.60
-BACKTEST_SIDE_MODES=long_only
-```
+V10.2 replaces mutable historical funding with a snapshot model:
 
-ETH/SOL pueden anadirse manualmente para experimentos separados, pero ya no se descargan ni calculan en cada backtest normal.
+- `state/funding/<symbol>.csv` contains rates;
+- `state/funding/<symbol>.meta.json` stores row count, coverage and SHA-256;
+- existing historical rows are immutable;
+- later runs may only append new tail events;
+- a gap greater than the configured limit fails closed;
+- a manually changed historical CSV fails hash verification.
 
-## Realismo de ejecucion
-
-El backtest incluye:
-
-- fees maker/taker configurables;
-- slippage de mercado;
-- funding historico por timestamp;
-- TP maker solo si el mercado cruza el objetivo el numero configurado de ticks;
-- SL primero si una OHLC toca SL y TP;
-- no usar el high previo al fill LIMIT dentro del mismo minuto;
-- cierre MARKET al final del dataset si queda una posicion abierta;
-- sizing compartido por equity/margen/riesgo.
-
-## Sensibilidad y stress
-
-El grid completo se selecciona al slippage primario (2 bp). Los finalistas se vuelven a medir por defecto en 1/2/3/5 bp.
-
-El candidato final ademas se somete a stress sin reabrir la optimizacion:
-
-- fees x1.0 / x1.2;
-- funding x1.0 / x1.5 / x2.0;
-- TP maker con cruce de 1 / 2 ticks.
-
-Salida adicional:
-
-`state/backtest_v9_stress.csv`.
-
-## Scheduler y seguridad live
-
-Cuando esta flat, el proceso se alinea al cierre de la vela (`HH:00:02`) en lugar de acumular `sleep(60)`. Las entradas pending se reconcilian cada 10 s. El motor mantiene persistencia JSON, reconciliacion fail-closed y proteccion SL/TP desde el fill real.
-
-## Caches
-
-- `state/minute/`: ventanas 1m;
-- `state/funding/`: funding historico;
-- `state/history/`: 1h/4h incremental;
-- `state/backtest_v9_opportunities.csv`: oportunidades unitarias cacheadas;
-- `.meta.json`: fingerprint de inputs economicos.
-
-Para forzar regeneracion:
+On the first V10.2 run, an old funding cache without metadata is rebuilt once automatically. To deliberately create a new snapshot later:
 
 ```bash
-BACKTEST_REBUILD_OPPORTUNITIES=True python backtest.py
+python backtest_v10_2.py --rebuild-funding
 ```
 
-## Ejecutar
+Do not use that flag casually if you want exact historical reproducibility.
+
+## Sizing study
+
+Only the primary `zscore_and_shock1h` candidate is subjected to a sizing grid. Defaults:
+
+```dotenv
+V10_2_RISK_GRID=0.005,0.0075,0.01,0.015
+V10_2_MAX_POSITION_GRID=0.30,0.50,0.70,1.00
+V10_2_SIZING_DD_LIMIT=0.10
+V10_2_SIZING_MIN_PF=1.20
+```
+
+The output includes annualized historical return and an illustrative annual EUR amount on EUR 10,000. These are backtest statistics, not a forward expectation.
+
+## Sensitivity and stress
+
+The control and primary candidate are re-evaluated at 1/2/3/5 bp market slippage. Both also receive fee/funding stress using the configured multipliers.
+
+## Cleanup
+
+V10.2 removes old source entrypoints from the repository. By default the backtest also deletes generated files matching old research prefixes (`backtest_v9*`, `backtest_v10_*` except `backtest_v10_2_*`). It does **not** delete:
+
+- live state or execution journals;
+- `state/history/`;
+- `state/minute/`;
+- `state/taker/`;
+- `state/funding/`.
+
+Disable generated-artifact cleanup with:
+
+```dotenv
+V10_2_CLEAN_OLD_ARTIFACTS=False
+```
+
+## Run
 
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
-python backtest.py
+python backtest_v10_2.py
 ```
 
-Demo/live:
+Demo/live remains:
 
 ```bash
 caffeinate -i python main.py
@@ -113,14 +111,12 @@ caffeinate -i python main.py
 
 ## Outputs
 
-- `state/backtest_v9_summary.csv`
-- `state/backtest_v9_annual.csv`
-- `state/backtest_v9_walk_forward.csv`
-- `state/backtest_v9_walk_forward_trades.csv`
-- `state/backtest_v9_sensitivity.csv`
-- `state/backtest_v9_stress.csv`
-- `state/backtest_v9_opportunities.csv`
-- `state/backtest_v9_trades.csv`
-- `state/backtest_v9_recommendation.json`
+- `state/backtest_v10_2_summary.csv`
+- `state/backtest_v10_2_annual.csv`
+- `state/backtest_v10_2_opportunities.csv`
+- `state/backtest_v10_2_sizing.csv`
+- `state/backtest_v10_2_sensitivity.csv`
+- `state/backtest_v10_2_stress.csv`
+- `state/backtest_v10_2_recommendation.json`
 
-`recommendation.json` incluye el candidato estatico, su detalle anual, stress y el walk-forward dinamico solo como diagnostico.
+`backtest_v10_2_recommendation.json` records the funding snapshot hash, control/candidate metrics, historical sizing candidate, and the explicit requirement for fresh forward validation.
