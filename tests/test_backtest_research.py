@@ -2,28 +2,8 @@ import math
 
 import pandas as pd
 
-from backtest_v10_2 import _and_frame, _apply_economic_stress
+from backtest_v10_4 import _apply_economic_stress
 from src.research.engine import EntryFill, ExitPolicy, simulate_trade_path
-
-
-def test_v10_2_confirmation_requires_same_candle_and():
-    idx = pd.date_range("2026-01-01T00:00:00Z", periods=3, freq="1h")
-    base = pd.DataFrame(
-        {
-            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
-            "volume": 1.0, "atr": 1.0, "regime_ma": 90.0,
-            "regime_long": True, "regime_short": False,
-            "exit_long_mean": False, "exit_short_mean": False,
-        },
-        index=idx,
-    )
-    trigger = base.copy()
-    trigger["entry_long"] = [False, True, True]
-    trigger["signal_value"] = [0.0, -2.0, -1.0]
-    confirm = base.copy()
-    confirm["entry_long"] = [True, False, True]
-    out = _and_frame(base, trigger, confirm)
-    assert out["entry_long"].tolist() == [False, False, True]
 
 
 def test_fee_and_funding_stress_recomputes_net_economics():

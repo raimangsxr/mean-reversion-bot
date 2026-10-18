@@ -1,122 +1,115 @@
-# mean-reversion-bot - V10.2
+# mean-reversion-bot - V10.4
 
-V10.2 consolidates the repository around one live code path and one research experiment.
-Older research entrypoints and versioned modules have been removed.
+V10.4 is the only research version kept in the repository. Live/Demo execution remains unchanged while research studies one question: can the frozen `z-score + shock1h` edge be replicated across additional liquid USD-M perpetuals to raise trade frequency without destroying PF?
 
 ## Live / Demo
 
-The live trigger is intentionally unchanged while V10.2 is researched:
+Live remains unchanged and is not auto-promoted by V10.4:
 
 - BTC/USDT:USDT, LONG only;
-- confirmed z-score re-entry: window 20, threshold 2.2;
-- regime: 1h SMA200 + 4h EMA200;
-- LIMIT postOnly at -3 bp from signal close, wait 7 minutes;
+- confirmed z-score re-entry, window 20 / threshold 2.2;
+- regime 1h SMA200 + 4h EMA200;
+- LIMIT postOnly at -3 bp, wait 7 minutes;
 - MARKET fallback only inside the +5 bp no-chase cap;
 - SL = 1.5 ATR from actual fill;
 - TP = fixed RR 1.8, reduceOnly maker LIMIT;
-- base risk/trade = 0.5%;
-- max position = 30% of equity;
-- isolated margin, leverage 2.
+- risk/trade = 0.5%; max position = 30%; isolated 2x.
 
-V10.2 does **not** switch the live signal to the new confirmation candidate automatically.
+## Frozen V10.4 research signal
 
-## V10.2 research question
+Every market uses exactly the same 1h setup:
 
-The trigger remains z-score. V10.2 asks whether a same-candle confirmation improves trade quality:
+```text
+confirmed z-score re-entry: z[t-1] < -2.2 and z[t] >= -2.2
+AND
+confirmed normalized 1-hour downside-shock re-entry at threshold 2.175
+```
 
-1. `zscore_only` - control;
-2. `zscore_and_shock1h` - primary hypothesis;
-3. `zscore_and_shock3h`;
-4. `zscore_and_vwap48h`;
-5. `zscore_and_taker`.
+No threshold, timeframe, RR, ATR, regime, sizing or execution parameter is retuned per asset.
 
-The confirmation thresholds are frozen before this run:
+## Cross-asset universe
 
-- shock 1h = 2.175 normalized-vol units;
-- shock 3h = 1.725;
-- VWAP48 deviation = 1.55 ATR;
-- taker exhaustion min shock = 0.925 ATR.
+The reference portfolio from V10.3 is BTC + BNB. V10.4 adds a pre-registered expansion basket:
 
-There is no threshold optimization in V10.2.
+```text
+BTC, BNB,
+SOL, DOGE, ADA, LINK, AVAX, BCH, TRX, DOT
+```
 
-### Important statistical status
+ETH/LTC/XRP are not in the default V10.4 basket because V10.3 already rejected them individually with the same frozen signal.
 
-The shock1h combination was discovered after inspecting 2022+ results. Therefore V10.2 reports 2022+ as **development/diagnostic data**, not as a fresh holdout. Even if historical metrics are excellent, `recommendation.json` always keeps `promotion_to_live=false`; a fresh forward test is required.
+## Component gate
+
+Every market must demonstrate edge independently before it can enter the expansion path:
+
+```dotenv
+V10_4_MIN_COMPONENT_TRADES=20
+V10_4_MIN_COMPONENT_PF=1.20
+V10_4_COMPONENT_DD_LIMIT=0.10
+V10_4_MIN_POSITIVE_YEARS=3
+```
+
+## Portfolio construction rule
+
+V10.4 deliberately avoids an exhaustive subset search.
+
+1. Start from the individually-qualified reference symbols (BTC + BNB).
+2. Rank only the newly-qualified assets by individual PF.
+3. Add them one by one in that fixed ranking.
+4. The **first** sequential step that reaches all portfolio gates is the historical forward-test candidate.
+5. Later combinations are not allowed to replace it simply because they backtest better.
+
+Portfolio gates:
+
+```dotenv
+V10_4_TARGET_MIN_TRADES_PER_YEAR=24
+V10_4_TARGET_MAX_TRADES_PER_YEAR=40
+V10_4_PORTFOLIO_MIN_PF=1.60
+V10_4_PORTFOLIO_DD_LIMIT=0.07
+V10_4_MIN_PORTFOLIO_POSITIVE_YEARS=4
+```
+
+V10.4 also reports trades/month plus median, P90 and maximum days between entries so frequency is measured as actual cadence, not just an annual average.
+
+## Statistical status
+
+The BTC signal thresholds were discovered after inspecting 2022+, so 2022+ is not a fresh temporal holdout. The new assets are useful cross-sectional external tests because their data was not used to derive those BTC thresholds, but any portfolio selected by V10.4 still requires fresh forward validation.
+
+`promotion_to_live` therefore remains `false`.
 
 ## Funding reproducibility
 
-V10.2 replaces mutable historical funding with a snapshot model:
+Funding is snapshotted per symbol under `state/funding/` with SHA-256 metadata. Historical rows are immutable; later runs may append only new tail rows. Gaps or historical modifications fail closed.
 
-- `state/funding/<symbol>.csv` contains rates;
-- `state/funding/<symbol>.meta.json` stores row count, coverage and SHA-256;
-- existing historical rows are immutable;
-- later runs may only append new tail events;
-- a gap greater than the configured limit fails closed;
-- a manually changed historical CSV fails hash verification.
-
-On the first V10.2 run, an old funding cache without metadata is rebuilt once automatically. To deliberately create a new snapshot later:
+To deliberately rebuild snapshots:
 
 ```bash
-python backtest_v10_2.py --rebuild-funding
+python backtest_v10_4.py --rebuild-funding
 ```
 
-Do not use that flag casually if you want exact historical reproducibility.
-
-## Sizing study
-
-Only the primary `zscore_and_shock1h` candidate is subjected to a sizing grid. Defaults:
-
-```dotenv
-V10_2_RISK_GRID=0.005,0.0075,0.01,0.015
-V10_2_MAX_POSITION_GRID=0.30,0.50,0.70,1.00
-V10_2_SIZING_DD_LIMIT=0.10
-V10_2_SIZING_MIN_PF=1.20
-```
-
-The output includes annualized historical return and an illustrative annual EUR amount on EUR 10,000. These are backtest statistics, not a forward expectation.
-
-## Sensitivity and stress
-
-The control and primary candidate are re-evaluated at 1/2/3/5 bp market slippage. Both also receive fee/funding stress using the configured multipliers.
-
-## Cleanup
-
-V10.2 removes old source entrypoints from the repository. By default the backtest also deletes generated files matching old research prefixes (`backtest_v9*`, `backtest_v10_*` except `backtest_v10_2_*`). It does **not** delete:
-
-- live state or execution journals;
-- `state/history/`;
-- `state/minute/`;
-- `state/taker/`;
-- `state/funding/`.
-
-Disable generated-artifact cleanup with:
-
-```dotenv
-V10_2_CLEAN_OLD_ARTIFACTS=False
-```
+Do not use this casually if exact reproducibility matters.
 
 ## Run
 
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
-python backtest_v10_2.py
+python backtest_v10_4.py
 ```
 
-Demo/live remains:
-
-```bash
-caffeinate -i python main.py
-```
+The first run may download 1h/4h history, funding and selected 1m execution windows for the new assets. Subsequent runs reuse caches.
 
 ## Outputs
 
-- `state/backtest_v10_2_summary.csv`
-- `state/backtest_v10_2_annual.csv`
-- `state/backtest_v10_2_opportunities.csv`
-- `state/backtest_v10_2_sizing.csv`
-- `state/backtest_v10_2_sensitivity.csv`
-- `state/backtest_v10_2_stress.csv`
-- `state/backtest_v10_2_recommendation.json`
+Only V10.4 research artifacts are produced:
 
-`backtest_v10_2_recommendation.json` records the funding snapshot hash, control/candidate metrics, historical sizing candidate, and the explicit requirement for fresh forward validation.
+- `state/backtest_v10_4_markets.csv`
+- `state/backtest_v10_4_expansion.csv`
+- `state/backtest_v10_4_portfolios.csv`
+- `state/backtest_v10_4_annual.csv`
+- `state/backtest_v10_4_opportunities.csv`
+- `state/backtest_v10_4_sensitivity.csv`
+- `state/backtest_v10_4_stress.csv`
+- `state/backtest_v10_4_recommendation.json`
+
+Old V9/V10/V10.1/V10.2/V10.3 generated research artifacts are deleted automatically. Historical/minute/funding caches, live state and execution journals are preserved.

@@ -267,7 +267,7 @@ def main() -> None:
         raise ValueError(f"EXIT_MODE={EXIT_MODE!r} no soportado: {sorted(VALID_EXIT_MODES)}")
 
     print(
-        "Mean-reversion V10.2 | Binance USD-M | "
+        "Mean-reversion V10.4 | Binance USD-M | "
         f"symbols={LIVE_SYMBOLS} {TIMEFRAME} | {LEVERAGE}x | exit={EXIT_MODE} | "
         f"RR={RISK_REWARD_RATIO:.2f} | risk/trade={RISK_PER_TRADE:.2%} | "
         f"maxpos={MAX_POSITION_PCT:.0%} | portfolio-risk={MAX_PORTFOLIO_RISK_PCT:.2%} | "

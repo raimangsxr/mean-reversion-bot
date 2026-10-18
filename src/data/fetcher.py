@@ -207,7 +207,7 @@ def fetch_binance_history_cached(
 
     The first call downloads the requested history. Later calls only request
     closed candles missing at the head/tail, avoiding six full-history downloads
-    on every V10.2 run (BTC/ETH/SOL x 1h/4h).
+    on every pullback-limit run (BTC/ETH/SOL x 1h/4h).
     """
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)

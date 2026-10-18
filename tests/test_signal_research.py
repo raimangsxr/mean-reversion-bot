@@ -25,7 +25,7 @@ def _base(n=260):
     )
 
 
-def test_v10_2_signal_specs_parse_without_duplicates():
+def test_signal_specs_parse_without_duplicates():
     names = [
         "zscore_20_2.2",
         "return_shock_1h_2.175",
@@ -61,7 +61,7 @@ def test_zscore_control_uses_confirmed_reentry_definition():
     )
 
 
-def test_taker_exhaustion_accepts_frozen_v10_2_threshold():
+def test_taker_exhaustion_accepts_frozen_threshold():
     base = _base(130)
     i = 110
     base.iloc[i - 1, base.columns.get_loc("close")] = 95.0

@@ -63,3 +63,24 @@ def test_tampered_funding_snapshot_is_rejected(tmp_path, monkeypatch):
         engine.ensure_funding_cache(
             "BTC/USDT:USDT", "2026-01-01T00:00:00Z", "2026-01-02T08:00:00Z"
         )
+
+
+def test_funding_loader_accepts_mixed_iso_timestamp_formats(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "BACKTEST_FUNDING_CACHE_DIR", str(tmp_path))
+    path = tmp_path / "btc_usdt_usdt.csv"
+    pd.DataFrame(
+        {
+            "timestamp": [
+                "2026-01-01 00:00:00+00:00",
+                "2026-01-01T08:00:00+00:00",
+                "2026-01-01 16:00:00.123000+00:00",
+                "2026-01-02T00:00:00.456+00:00",
+            ],
+            "funding_rate": [0.0001, -0.0002, 0.0003, 0.0001],
+        }
+    ).to_csv(path, index=False)
+
+    loaded = engine.load_funding_cache("BTC/USDT:USDT")
+    assert len(loaded) == 4
+    assert loaded.index.notna().all()
+    assert loaded.index.tz is not None

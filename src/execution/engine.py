@@ -66,15 +66,15 @@ class BotState:
     side: Optional[str] = None
     entry_order_id: Optional[str] = None
     entry_client_order_id: Optional[str] = None
-    # market para la entrada/fallback V10.2; limit para la entrada pasiva V10.2.
+    # market para la entrada/fallback pullback-limit; limit para la entrada pasiva pullback-limit.
     entry_order_kind: Optional[str] = None
     entry_time: Optional[str] = None
     entry_price: Optional[float] = None
     amount: Optional[float] = None
 
-    # V10.2: entrada LIMIT persistente. Estos campos solo viven mientras status
+    # pullback-limit: entrada LIMIT persistente. Estos campos solo viven mientras status
     # esta en entry_pending*. Al proteger el fill se limpian.
-    # La entrada V10.2 usa dos referencias distintas:
+    # La entrada pullback-limit usa dos referencias distintas:
     # - pending_reference_price: close de la vela de senal; ancla la LIMIT -offset.
     # - pending_fallback_reference_price: precio observado en t=0; ancla el cap no-chase.
     pending_reference_price: Optional[float] = None
@@ -1014,7 +1014,7 @@ class BinanceExecutionEngine:
         use_take_profit: bool,
         journal_context: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Instala SL/TP a partir del fill real, comun a MARKET y LIMIT V10.2."""
+        """Instala SL/TP a partir del fill real, comun a MARKET y LIMIT pullback-limit."""
         if side == "long":
             stop_price = fill_price - stop_distance
             take_profit_price = (
@@ -1392,16 +1392,16 @@ class BinanceExecutionEngine:
         fallback_reference_price: Optional[float] = None,
         journal_context: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Crea la entrada V10.2 persistente.
+        """Crea la entrada pullback-limit persistente.
 
-        V10.2 usa dos referencias distintas:
+        pullback-limit usa dos referencias distintas:
         - reference_price: close de la vela de senal; ancla la LIMIT +/- offset.
         - fallback_reference_price: precio observado al iniciar (t=0); ancla el
           cap no-chase del fallback.
 
         Si la LIMIT ya seria marketable en t=0, no se fuerza una orden postOnly
         que Binance rechazaria. Se persiste un estado wait-only y, al expirar,
-        se evalua el mismo fallback condicional que en el research V10.2.
+        se evalua el mismo fallback condicional que en el research pullback-limit.
         """
         if side not in {"long", "short"}:
             raise ValueError("side debe ser long o short.")
@@ -1444,7 +1444,7 @@ class BinanceExecutionEngine:
         if limit_price <= 0:
             raise ExecutionError("Precio LIMIT de entrada invalido tras precision.")
 
-        # Condicion conservadora V10.2: la orden solo se considera
+        # Condicion conservadora pullback-limit: la orden solo se considera
         # postOnly si puede descansar desde t=0. Si ya seria marketable, se
         # espera sin orden hasta la decision de fallback.
         resting_possible = (
@@ -1487,7 +1487,7 @@ class BinanceExecutionEngine:
 
         if not resting_possible:
             state.note = (
-                "V10.2: LIMIT no puede descansar postOnly en t=0; "
+                "pullback-limit: LIMIT no puede descansar postOnly en t=0; "
                 "esperando decision de fallback."
             )
             self.state_store.save(state)
@@ -1507,7 +1507,7 @@ class BinanceExecutionEngine:
             )
             return {"order": None, "state": state}
 
-        state.note = "Enviando entrada LIMIT postOnly V10.2."
+        state.note = "Enviando entrada LIMIT postOnly pullback-limit."
         self.state_store.save(state)
 
         submit_time = self._now_iso()
@@ -1546,7 +1546,7 @@ class BinanceExecutionEngine:
                 or "could not be executed as maker" in error_text
             )
             if post_only_rejection:
-                # El research V10.2 no fuerza un fill taker si la LIMIT no puede
+                # El research pullback-limit no fuerza un fill taker si la LIMIT no puede
                 # descansar en t=0. Conservamos la senal en wait-only y
                 # dejamos que el fallback/no-chase decida al expirar.
                 state.status = "entry_pending"
@@ -1554,7 +1554,7 @@ class BinanceExecutionEngine:
                 state.entry_client_order_id = None
                 state.entry_order_kind = "wait"
                 state.note = (
-                    "V10.2: Binance rechazo postOnly por marketable; "
+                    "pullback-limit: Binance rechazo postOnly por marketable; "
                     "esperando decision de fallback."
                 )
                 self.state_store.save(state)
@@ -1601,7 +1601,7 @@ class BinanceExecutionEngine:
 
         state.entry_order_id = order_id
         state.status = "entry_pending"
-        state.note = "Entrada LIMIT postOnly V10.2 pendiente de fill."
+        state.note = "Entrada LIMIT postOnly pullback-limit pendiente de fill."
         self.state_store.save(state)
         self._journal(
             "entry_pending_created",
@@ -1623,7 +1623,7 @@ class BinanceExecutionEngine:
         return {"order": order, "state": state}
 
     def resolve_pending_entry(self, symbol: str) -> dict[str, Any]:
-        """Expira la entrada V10.2 y aplica fallback MARKET solo dentro del cap."""
+        """Expira la entrada pullback-limit y aplica fallback MARKET solo dentro del cap."""
         state = self.state_store.load()
         if state.status not in self.ENTRY_PENDING_STATUSES:
             return {"action": "not_pending", "state": state}
@@ -1635,7 +1635,7 @@ class BinanceExecutionEngine:
                     "action": "unknown_position",
                     "state": state,
                     "reason": (
-                        "Aparecio una posicion mientras V10.2 estaba en wait-only; "
+                        "Aparecio una posicion mientras pullback-limit estaba en wait-only; "
                         "no puede atribuirse a una orden del bot."
                     ),
                 }
@@ -1725,7 +1725,7 @@ class BinanceExecutionEngine:
 
         if lateness > max_lateness:
             flat = self._set_flat(
-                f"Entrada V10.2 cancelada: fallback demasiado tarde ({lateness:.0f}s)."
+                f"Entrada pullback-limit cancelada: fallback demasiado tarde ({lateness:.0f}s)."
             )
             self._journal(
                 "entry_cancelled_late",
@@ -1742,7 +1742,7 @@ class BinanceExecutionEngine:
         assert current_price is not None and cap_price is not None
         if not within_cap:
             flat = self._set_flat(
-                "Entrada V10.2 cancelada: precio fuera del cap no-chase."
+                "Entrada pullback-limit cancelada: precio fuera del cap no-chase."
             )
             self._journal(
                 "entry_cancelled_no_chase",
@@ -1774,7 +1774,7 @@ class BinanceExecutionEngine:
             context=context,
         )
         self._set_flat(
-            "Entrada V10.2 expirada; ejecutando fallback MARKET dentro del cap."
+            "Entrada pullback-limit expirada; ejecutando fallback MARKET dentro del cap."
         )
         fallback_context = {
             **context,
@@ -1814,7 +1814,7 @@ class BinanceExecutionEngine:
             }
 
         if state.status in self.ENTRY_PENDING_STATUSES:
-            # V10.2 wait-only: la LIMIT no pudo descansar postOnly en t=0, por
+            # pullback-limit wait-only: la LIMIT no pudo descansar postOnly en t=0, por
             # lo que no existe una orden del bot que pueda atribuir una posicion.
             if state.entry_order_kind == "wait":
                 if position is not None:
@@ -1824,7 +1824,7 @@ class BinanceExecutionEngine:
                         "state": state,
                         "position": position,
                         "reason": (
-                            "Aparecio una posicion durante un wait-only V10.2; "
+                            "Aparecio una posicion durante un wait-only pullback-limit; "
                             "no se puede atribuir al bot de forma segura."
                         ),
                     }
@@ -2047,7 +2047,7 @@ class BinanceExecutionEngine:
                 f"Stop no abierto mientras la posicion sigue viva: SL={stop_status}",
             )
 
-        # TP parcial V10.2: mientras siga abierto forma parte del plan reduceOnly.
+        # TP parcial pullback-limit: mientras siga abierto forma parte del plan reduceOnly.
         # Solo consideramos completado el parcial cuando Binance confirma que se
         # ha ejecutado toda la cantidad prevista; entonces main puede mover el
         # stop a break-even de forma segura.

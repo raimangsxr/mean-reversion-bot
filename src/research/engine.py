@@ -49,8 +49,9 @@ from config.settings import (
     TIMEFRAME,
     TREND_WINDOW,
     Z_THRESHOLD,
-    V10_2_FUNDING_MAX_GAP_HOURS,
+    V10_4_FUNDING_MAX_GAP_HOURS,
 )
+from src.data.fetcher import timeframe_to_timedelta
 from src.risk.manager import RiskManager
 from src.strategy.mean_reversion import MeanReversionStrategy
 
@@ -287,11 +288,11 @@ def parse_exit_profile(name: str, rr: float) -> ExitPolicy:
     if value == "hybrid_rr_mean_time24":
         return ExitPolicy(value, rr, mean_exit=True, time_stop_hours=24)
 
-    raise ValueError(f"Perfil de salida V10.2 desconocido: {name}")
+    raise ValueError(f"Perfil de salida V10.4 desconocido: {name}")
 
 
 # -----------------------------------------------------------------------------
-# Entrada V10.2 congelada y generalizada simetricamente a LONG/SHORT.
+# Entrada V10.4 congelada y generalizada simetricamente a LONG/SHORT.
 # -----------------------------------------------------------------------------
 def resolve_entry(
     minute_hour: pd.DataFrame,
@@ -414,23 +415,34 @@ def save_minute_cache(symbol: str, df: pd.DataFrame) -> None:
     out.to_csv(path, index=False)
 
 
-def minute_window(cache: pd.DataFrame, hour: pd.Timestamp) -> pd.DataFrame:
-    """Return one hour using DatetimeIndex binary search, not a full-cache mask."""
+def minute_period(
+    cache: pd.DataFrame, start: pd.Timestamp, duration: pd.Timedelta
+) -> pd.DataFrame:
+    """Return an arbitrary minute-resolution period using DatetimeIndex search."""
     if cache.empty:
         return cache.iloc[0:0]
-    hour = hour.tz_localize("UTC") if hour.tzinfo is None else hour.tz_convert("UTC")
-    end = hour + pd.Timedelta(hours=1)
+    start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
+    if duration <= pd.Timedelta(0):
+        raise ValueError("duration debe ser positiva")
+    end = start + duration
     index = cache.index
-    left = int(index.searchsorted(hour, side="left"))
+    left = int(index.searchsorted(start, side="left"))
     right = int(index.searchsorted(end, side="left"))
     return cache.iloc[left:right]
 
 
-def candidate_entry_hours(signals: pd.DataFrame, include_shorts: bool) -> list[pd.Timestamp]:
+def minute_window(cache: pd.DataFrame, hour: pd.Timestamp) -> pd.DataFrame:
+    """Backward-compatible one-hour minute window."""
+    return minute_period(cache, hour, pd.Timedelta(hours=1))
+
+
+def candidate_entry_hours(
+    signals: pd.DataFrame, include_shorts: bool, timeframe: str = TIMEFRAME
+) -> list[pd.Timestamp]:
     mask = signals["entry_long"].fillna(False).astype(bool)
     if include_shorts:
         mask = mask | signals["entry_short"].fillna(False).astype(bool)
-    delta = pd.Timedelta(TIMEFRAME)
+    delta = timeframe_to_timedelta(timeframe)
     return sorted(set((signals.index[mask] + delta).tolist()))
 
 
@@ -450,12 +462,26 @@ def _public_exchange():
     return exchange
 
 
-def ensure_minute_cache(symbol: str, signals: pd.DataFrame, include_shorts: bool) -> pd.DataFrame:
+def ensure_minute_cache(
+    symbol: str,
+    signals: pd.DataFrame,
+    include_shorts: bool,
+    timeframe: str = TIMEFRAME,
+) -> pd.DataFrame:
     cache = load_minute_cache(symbol)
-    hours = candidate_entry_hours(signals, include_shorts)
-    missing = [h for h in hours if len(minute_window(cache, h)) < 60]
+    starts = candidate_entry_hours(signals, include_shorts, timeframe=timeframe)
+    duration = timeframe_to_timedelta(timeframe)
+    required_minutes = int(duration / pd.Timedelta(minutes=1))
+    if required_minutes < 1 or duration != pd.Timedelta(minutes=required_minutes):
+        raise ValueError(f"Timeframe research no compatible con cache 1m: {timeframe}")
+    if required_minutes > 1000:
+        raise ValueError("Timeframe research demasiado grande para una sola descarga 1m")
+    missing = [
+        start for start in starts
+        if len(minute_period(cache, start, duration)) < required_minutes
+    ]
     print(
-        f"{symbol}: senales candidatas={len(hours)} | horas 1m cache={len(hours)-len(missing)} "
+        f"{symbol} {timeframe}: senales candidatas={len(starts)} | periodos 1m cache={len(starts)-len(missing)} "
         f"| por descargar={len(missing)}"
     )
     if not missing:
@@ -463,12 +489,12 @@ def ensure_minute_cache(symbol: str, signals: pd.DataFrame, include_shorts: bool
 
     exchange = _public_exchange()
     rows: list[list[float]] = []
-    for i, hour in enumerate(missing, start=1):
-        since = int(hour.timestamp() * 1000)
-        batch = exchange.fetch_ohlcv(symbol, "1m", since=since, limit=60)
+    for i, start in enumerate(missing, start=1):
+        since = int(start.timestamp() * 1000)
+        batch = exchange.fetch_ohlcv(symbol, "1m", since=since, limit=required_minutes)
         rows.extend(batch)
         if i % 25 == 0 or i == len(missing):
-            print(f"  {symbol} cache 1m: {i}/{len(missing)}")
+            print(f"  {symbol} {timeframe} cache 1m: {i}/{len(missing)}")
 
     if rows:
         new = pd.DataFrame(
@@ -501,7 +527,12 @@ def load_funding_cache(symbol: str) -> pd.DataFrame:
             columns=["funding_rate"],
             index=pd.DatetimeIndex([], tz="UTC", name="timestamp"),
         )
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    # Funding caches can contain valid ISO-8601 timestamps with mixed renderings
+    # (space/T separator and optional fractional seconds). Pandas otherwise infers
+    # one format from the first row and silently coerces the other valid rows to NaT.
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"], format="mixed", utc=True, errors="coerce"
+    )
     return (
         df.dropna(subset=["timestamp"])
         .drop_duplicates(subset="timestamp", keep="last")
@@ -549,7 +580,7 @@ def _verify_funding_snapshot(symbol: str, cache: pd.DataFrame) -> dict:
     if not meta_path.exists():
         raise RuntimeError(
             f"Cache funding legacy para {symbol}: falta snapshot metadata. "
-            "Ejecuta backtest_v10_2.py --rebuild-funding una vez."
+            "Ejecuta backtest_v10_4.py --rebuild-funding una vez."
         )
     try:
         expected = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -625,10 +656,10 @@ def _assert_funding_continuity(cache: pd.DataFrame, start_ts: pd.Timestamp, end_
         return
     gaps = sliced.index.to_series().diff().dropna().dt.total_seconds() / 3600.0
     max_gap = float(gaps.max()) if not gaps.empty else 0.0
-    if max_gap > V10_2_FUNDING_MAX_GAP_HOURS:
+    if max_gap > V10_4_FUNDING_MAX_GAP_HOURS:
         raise RuntimeError(
             f"Funding snapshot tiene un hueco de {max_gap:.1f}h (> "
-            f"{V10_2_FUNDING_MAX_GAP_HOURS:g}h). Reconstruye con --rebuild-funding."
+            f"{V10_4_FUNDING_MAX_GAP_HOURS:g}h). Reconstruye con --rebuild-funding."
         )
 
 
@@ -821,10 +852,11 @@ def prepare_entry_candidates(
     minute_cache: pd.DataFrame,
     market_slippage_bps: float,
     include_shorts: bool,
+    signal_timeframe: str = TIMEFRAME,
 ) -> list[EntryCandidate]:
     """Resolve the V8/V9 entry once per signal/slippage and reuse for all exits."""
     candidates: list[EntryCandidate] = []
-    delta = pd.Timedelta(TIMEFRAME)
+    delta = timeframe_to_timedelta(signal_timeframe)
     index = signals.index
     closes = signals["close"].to_numpy(dtype=float, copy=False)
     atrs = signals["atr"].to_numpy(dtype=float, copy=False)
@@ -842,7 +874,7 @@ def prepare_entry_candidates(
             sides.append("short")
         if not sides:
             continue
-        window = minute_window(minute_cache, entry_hour)
+        window = minute_period(minute_cache, entry_hour, delta)
         if window.empty:
             continue
         for side in sides:
@@ -973,6 +1005,7 @@ def simulate_trade_path(
     path_arrays: Optional[PathArrays] = None,
     funding_series: Optional[FundingSeries] = None,
     tp_cross_ticks: int = BACKTEST_TP_CROSS_TICKS,
+    signal_timeframe: str = TIMEFRAME,
 ) -> Optional[TradeOpportunity]:
     stop_distance = signal_atr * ATR_MULTIPLIER
     if not math.isfinite(stop_distance) or stop_distance <= 0:
@@ -1169,7 +1202,7 @@ def simulate_trade_path(
             pending_break_even = False
 
     # Horas siguientes sobre arrays NumPy. Evita signals.loc[mask] + iterrows
-    # para cada trade, que era el principal hot path de V10.2.
+    # para cada trade, que era el principal hot path de V10.4.
     start_pos = int(arrays.index.searchsorted(entry_hour, side="right"))
     exited = False
     exit_time: Optional[pd.Timestamp] = None
@@ -1243,7 +1276,7 @@ def simulate_trade_path(
         realized_gross += gross
         exit_fees += fee
         exit_slippage += slip
-        exit_time = arrays.index[final_pos] + pd.Timedelta(hours=1)
+        exit_time = arrays.index[final_pos] + timeframe_to_timedelta(signal_timeframe)
         reason = "end_of_data"
 
     assert exit_time is not None
@@ -1263,10 +1296,11 @@ def generate_opportunities(
     path_arrays: Optional[PathArrays] = None,
     funding_series: Optional[FundingSeries] = None,
     tp_cross_ticks: int = BACKTEST_TP_CROSS_TICKS,
+    signal_timeframe: str = TIMEFRAME,
 ) -> pd.DataFrame:
     """Generate independent unit opportunities.
 
-    V10.2 original imposed ``symbol_busy_until`` here. That was both slow and
+    V10.4 original imposed ``symbol_busy_until`` here. That was both slow and
     conceptually too early: whether a prior signal actually consumes the symbol
     depends on portfolio sizing/concurrency. We now generate every valid signal
     path independently and let ``simulate_portfolio`` enforce one live position
@@ -1280,10 +1314,13 @@ def generate_opportunities(
         minute_cache=minute_cache,
         market_slippage_bps=market_slippage_bps,
         include_shorts=include_shorts,
+        signal_timeframe=signal_timeframe,
     )
     records: list[dict] = []
     for candidate in candidates:
-        minute_hour = minute_window(minute_cache, candidate.entry_hour)
+        minute_hour = minute_period(
+            minute_cache, candidate.entry_hour, timeframe_to_timedelta(signal_timeframe)
+        )
         if minute_hour.empty:
             continue
         trade = simulate_trade_path(
@@ -1302,6 +1339,7 @@ def generate_opportunities(
             path_arrays=arrays,
             funding_series=funding_fast,
             tp_cross_ticks=tp_cross_ticks,
+            signal_timeframe=signal_timeframe,
         )
         if trade is not None:
             records.append(asdict(trade))
