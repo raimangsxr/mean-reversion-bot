@@ -313,7 +313,7 @@ def fetch_binance_taker_history(
     """Fetch raw USD-M klines including taker-buy base volume.
 
     CCXT ``fetch_ohlcv`` intentionally normalizes away Binance-specific kline
-    fields. V10 needs taker-buy volume for one pre-registered order-flow signal,
+    fields. Some research signals need taker-buy volume,
     so this research-only helper reads the public raw futures kline endpoint.
     """
     exchange = _make_public_futures_exchange()
@@ -396,7 +396,7 @@ def fetch_binance_taker_history_cached(
     cache_dir: str,
     limit: int = 1500,
 ) -> pd.DataFrame:
-    """Incremental cache for V10 taker-flow research fields."""
+    """Incremental cache for taker-flow research fields."""
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
     start_ts = start_ts.tz_localize("UTC") if start_ts.tzinfo is None else start_ts.tz_convert("UTC")
@@ -433,7 +433,7 @@ def fetch_binance_taker_history_cached(
         first = cache.index.min()
         last = cache.index.max()
         if first > start_ts:
-            # V10 principal es BTC, por lo que el contrato existe desde el
+            # Some contracts exist from the start of the requested window, while others
             # inicio configurado. Si se usa otro activo y el prefijo pre-listing
             # esta vacio, el caller puede ajustar BACKTEST_START.
             pieces.append(

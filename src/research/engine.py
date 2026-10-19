@@ -49,7 +49,7 @@ from config.settings import (
     TIMEFRAME,
     TREND_WINDOW,
     Z_THRESHOLD,
-    V10_4_FUNDING_MAX_GAP_HOURS,
+    FUNDING_MAX_GAP_HOURS,
 )
 from src.data.fetcher import timeframe_to_timedelta
 from src.risk.manager import RiskManager
@@ -288,11 +288,11 @@ def parse_exit_profile(name: str, rr: float) -> ExitPolicy:
     if value == "hybrid_rr_mean_time24":
         return ExitPolicy(value, rr, mean_exit=True, time_stop_hours=24)
 
-    raise ValueError(f"Perfil de salida V10.4 desconocido: {name}")
+    raise ValueError(f"Perfil de salida desconocido: {name}")
 
 
 # -----------------------------------------------------------------------------
-# Entrada V10.4 congelada y generalizada simetricamente a LONG/SHORT.
+# Entrada congelada y generalizada simetricamente a LONG/SHORT.
 # -----------------------------------------------------------------------------
 def resolve_entry(
     minute_hour: pd.DataFrame,
@@ -580,7 +580,7 @@ def _verify_funding_snapshot(symbol: str, cache: pd.DataFrame) -> dict:
     if not meta_path.exists():
         raise RuntimeError(
             f"Cache funding legacy para {symbol}: falta snapshot metadata. "
-            "Ejecuta backtest_v10_4.py --rebuild-funding una vez."
+            "Reconstruye el snapshot de funding una vez."
         )
     try:
         expected = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -656,10 +656,10 @@ def _assert_funding_continuity(cache: pd.DataFrame, start_ts: pd.Timestamp, end_
         return
     gaps = sliced.index.to_series().diff().dropna().dt.total_seconds() / 3600.0
     max_gap = float(gaps.max()) if not gaps.empty else 0.0
-    if max_gap > V10_4_FUNDING_MAX_GAP_HOURS:
+    if max_gap > FUNDING_MAX_GAP_HOURS:
         raise RuntimeError(
             f"Funding snapshot tiene un hueco de {max_gap:.1f}h (> "
-            f"{V10_4_FUNDING_MAX_GAP_HOURS:g}h). Reconstruye con --rebuild-funding."
+            f"{FUNDING_MAX_GAP_HOURS:g}h). Reconstruye con --rebuild-funding."
         )
 
 
@@ -1202,7 +1202,7 @@ def simulate_trade_path(
             pending_break_even = False
 
     # Horas siguientes sobre arrays NumPy. Evita signals.loc[mask] + iterrows
-    # para cada trade, que era el principal hot path de V10.4.
+    # para cada trade, que era el principal hot path del replay.
     start_pos = int(arrays.index.searchsorted(entry_hour, side="right"))
     exited = False
     exit_time: Optional[pd.Timestamp] = None
@@ -1300,7 +1300,7 @@ def generate_opportunities(
 ) -> pd.DataFrame:
     """Generate independent unit opportunities.
 
-    V10.4 original imposed ``symbol_busy_until`` here. That was both slow and
+    The original implementation imposed ``symbol_busy_until`` here. That was both slow and
     conceptually too early: whether a prior signal actually consumes the symbol
     depends on portfolio sizing/concurrency. We now generate every valid signal
     path independently and let ``simulate_portfolio`` enforce one live position
@@ -1371,6 +1371,7 @@ def simulate_portfolio(
     max_portfolio_risk_pct: float = BACKTEST_MAX_PORTFOLIO_RISK_PCT,
     max_concurrent_positions: int = BACKTEST_MAX_CONCURRENT_POSITIONS,
     prefiltered_config: bool = False,
+    risk_per_trade_by_component: Optional[dict[str, float]] = None,
 ) -> PortfolioResult:
     if opportunities.empty:
         return PortfolioResult(
@@ -1457,7 +1458,18 @@ def simulate_portfolio(
         stop_fraction = float(op.stop_fraction)
         if not math.isfinite(stop_fraction) or stop_fraction <= 0:
             continue
-        risk_budget = realized_equity * config.risk_per_trade
+        component = str(getattr(op, "component", ""))
+        component_risk_per_trade = config.risk_per_trade
+        if risk_per_trade_by_component is not None:
+            component_risk_per_trade = float(
+                risk_per_trade_by_component.get(component, config.risk_per_trade)
+            )
+            if not math.isfinite(component_risk_per_trade) or component_risk_per_trade <= 0:
+                raise ValueError(
+                    f"Invalid component risk for {component or op.symbol}: "
+                    f"{component_risk_per_trade!r}"
+                )
+        risk_budget = realized_equity * component_risk_per_trade
         risk_sized_notional = risk_budget / stop_fraction
         max_position_notional = realized_equity * config.max_position_pct
         margin_notional = free_margin * leverage

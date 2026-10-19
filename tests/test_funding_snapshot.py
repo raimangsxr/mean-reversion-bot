@@ -43,7 +43,7 @@ def test_legacy_funding_cache_requires_explicit_rebuild(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "BACKTEST_FUNDING_CACHE_DIR", str(tmp_path))
     df = _funding()
     df.reset_index(names="timestamp").to_csv(tmp_path / "btc_usdt_usdt.csv", index=False)
-    with pytest.raises(RuntimeError, match="--rebuild-funding"):
+    with pytest.raises(RuntimeError, match="snapshot metadata"):
         engine.ensure_funding_cache(
             "BTC/USDT:USDT", "2026-01-01T00:00:00Z", "2026-01-02T08:00:00Z"
         )

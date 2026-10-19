@@ -18,13 +18,18 @@ from config.settings import (
     REGIME_TIMEFRAME,
     TIMEFRAME,
     TREND_WINDOW,
-    V10_4_RETURN_SHOCK_VOL_WINDOW,
-    V10_4_TAKER_LOOKBACK,
-    V10_4_TAKER_MIN_SHOCK_ATR,
-    V10_4_TAKER_SELL_QUANTILE,
+    RESEARCH_RETURN_SHOCK_VOL_WINDOW,
+    RESEARCH_TAKER_LOOKBACK,
+    RESEARCH_TAKER_MIN_SHOCK_ATR,
+    RESEARCH_TAKER_SELL_QUANTILE,
     Z_THRESHOLD,
 )
 from src.strategy.mean_reversion import MeanReversionStrategy
+from src.strategy.signal_components import (
+    confirmed_downside_reentry,
+    confirmed_upside_reentry,
+    standardized_log_return_shock,
+)
 
 
 @dataclass(frozen=True)
@@ -71,13 +76,13 @@ def parse_signal_spec(name: str) -> SignalSpec:
 
     m = re.fullmatch(r"taker_exhaustion(?:_([0-9]+(?:\.[0-9]+)?))?", value)
     if m:
-        min_shock = float(m.group(1)) if m.group(1) else V10_4_TAKER_MIN_SHOCK_ATR
+        min_shock = float(m.group(1)) if m.group(1) else RESEARCH_TAKER_MIN_SHOCK_ATR
         return SignalSpec(
             value,
             "taker_exhaustion",
             {
-                "lookback": V10_4_TAKER_LOOKBACK,
-                "sell_quantile": V10_4_TAKER_SELL_QUANTILE,
+                "lookback": RESEARCH_TAKER_LOOKBACK,
+                "sell_quantile": RESEARCH_TAKER_SELL_QUANTILE,
                 "min_shock_atr": min_shock,
             },
             requires_taker=True,
@@ -368,8 +373,8 @@ def apply_signal(
         ret_1h = log_close.diff()
         horizon_return = log_close.diff(hours)
         realized = ret_1h.rolling(
-            V10_4_RETURN_SHOCK_VOL_WINDOW,
-            min_periods=V10_4_RETURN_SHOCK_VOL_WINDOW,
+            RESEARCH_RETURN_SHOCK_VOL_WINDOW,
+            min_periods=RESEARCH_RETURN_SHOCK_VOL_WINDOW,
         ).std()
         denom = (realized * math.sqrt(hours)).replace(0.0, np.nan)
         return _confirmed_from_score(base, horizon_return / denom, threshold)
@@ -445,7 +450,7 @@ def apply_signal(
     raise ValueError(f"Familia research no implementada: {spec.family}")
 
 # -----------------------------------------------------------------------------
-# V10.4 frequency-expansion helpers.
+# Frequency-expansion helpers.
 # These functions keep the 1h/4h regime fixed while allowing the signal
 # timeframe to change. They do not tune any threshold.
 # -----------------------------------------------------------------------------
@@ -509,7 +514,7 @@ def prepare_frequency_expansion_base(
     """Build signal-timeframe OHLCV with the frozen 1h SMA200 + 4h EMA200 regime.
 
     The local trend is deliberately sourced from closed 1h candles rather than
-    recomputed on 30m/2h. This keeps the V9.2/V10.4 regime semantics unchanged.
+    recomputed on 30m/2h. This keeps the frozen regime semantics unchanged.
     ATR is scaled to approximately the same 14-hour wall-clock horizon.
     """
     result = signal_df.copy().sort_index()
@@ -597,7 +602,7 @@ def prepare_frequency_expansion_base(
 
 
 def _confirmed_event_from_score(score: pd.Series, threshold: float) -> pd.Series:
-    return ((score.shift(1) < -float(threshold)) & (score >= -float(threshold))).fillna(False)
+    return confirmed_downside_reentry(score, threshold)
 
 
 def _shock1h_event_on_frame(
@@ -615,10 +620,11 @@ def _shock1h_event_on_frame(
     if not math.isclose(horizon * per_bar, 1.0, rel_tol=0.0, abs_tol=1e-9):
         raise ValueError(f"{timeframe} no divide exactamente una hora")
     vol_window = scaled_window_for_hours(vol_window_hours, timeframe, minimum=horizon + 2)
-    log_close = np.log(frame["close"].astype(float).where(frame["close"].astype(float) > 0))
-    one_hour_return = log_close.diff(horizon)
-    realized = one_hour_return.rolling(vol_window, min_periods=vol_window).std().replace(0.0, np.nan)
-    score = one_hour_return / realized
+    _, _, score = standardized_log_return_shock(
+        frame["close"],
+        horizon_bars=horizon,
+        vol_window_bars=vol_window,
+    )
     return _confirmed_event_from_score(score, threshold)
 
 
@@ -676,4 +682,72 @@ def build_frequency_expansion_signal(
         & result["regime_long"].astype(bool)
     )
     result["entry_short"] = False
+    return result
+
+
+def build_bidirectional_frequency_expansion_signal(
+    base: pd.DataFrame,
+    *,
+    signal_timeframe: str = "1h",
+    shock_threshold: float = 2.175,
+    shock_vol_window_hours: float = 100.0,
+    z_window_hours: float = 20.0,
+    z_threshold: float = 2.2,
+) -> pd.DataFrame:
+    """Frozen bidirectional z-score + shock1h signal.
+
+    The long and short sides are exact mathematical mirrors. The
+    short side is its exact mathematical mirror: both z-score and standardized
+    one-hour shock must cross back inside their positive thresholds on the same
+    closed candle while the frozen 1h SMA200 + 4h EMA200 short regime is active.
+
+    This helper is deliberately restricted to 1h so timeframe semantics and
+    thresholds remain frozen.
+    """
+    if signal_timeframe != "1h":
+        raise ValueError("Bidirectional replay is frozen to signal_timeframe='1h'.")
+
+    result = base.copy()
+    close = result["close"].astype(float)
+    z_bars = scaled_window_for_hours(z_window_hours, signal_timeframe, minimum=3)
+    mean = close.rolling(z_bars, min_periods=z_bars).mean()
+    std = close.rolling(z_bars, min_periods=z_bars).std().replace(0.0, np.nan)
+    z = (close - mean) / std
+
+    shock_vol_bars = scaled_window_for_hours(
+        shock_vol_window_hours, signal_timeframe, minimum=3
+    )
+    shock_return, shock_volatility, shock_score = standardized_log_return_shock(
+        close,
+        horizon_bars=1,
+        vol_window_bars=shock_vol_bars,
+    )
+
+    z_long = confirmed_downside_reentry(z, z_threshold)
+    shock_long = confirmed_downside_reentry(shock_score, shock_threshold)
+    z_short = confirmed_upside_reentry(z, z_threshold)
+    shock_short = confirmed_upside_reentry(shock_score, shock_threshold)
+
+    ready = result[["regime_ma", "atr"]].notna().all(axis=1)
+    result["signal_value"] = z
+    result["z_score"] = z
+    result["shock1h_return"] = shock_return
+    result["shock1h_volatility"] = shock_volatility
+    result["shock1h_score"] = shock_score
+    result["z_long_confirmed"] = z_long
+    result["shock1h_long_confirmed"] = shock_long
+    result["z_short_confirmed"] = z_short
+    result["shock1h_short_confirmed"] = shock_short
+    result["entry_long"] = (
+        ready
+        & z_long
+        & shock_long
+        & result["regime_long"].astype(bool)
+    )
+    result["entry_short"] = (
+        ready
+        & z_short
+        & shock_short
+        & result["regime_short"].astype(bool)
+    )
     return result

@@ -3,6 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.strategy.signal_components import (
+    calculate_zscore,
+    confirmed_downside_reentry,
+    confirmed_upside_reentry,
+    standardized_log_return_shock,
+)
+
 
 VALID_REGIME_MODES = {
     "1h_sma200",
@@ -51,6 +58,8 @@ class MeanReversionStrategy:
         regime_timeframe: str = "4h",
         regime_ema_window: int = 200,
         regime_slope_lookback: int = 6,
+        shock1h_threshold: float | None = None,
+        return_shock_vol_window: int = 100,
     ) -> None:
         if entry_mode not in {"extreme", "confirmed"}:
             raise ValueError("entry_mode debe ser 'extreme' o 'confirmed'.")
@@ -64,6 +73,10 @@ class MeanReversionStrategy:
             raise ValueError("regime_ema_window debe ser positivo.")
         if regime_slope_lookback <= 0:
             raise ValueError("regime_slope_lookback debe ser positivo.")
+        if shock1h_threshold is not None and shock1h_threshold <= 0:
+            raise ValueError("shock1h_threshold debe ser positivo.")
+        if return_shock_vol_window <= 1:
+            raise ValueError("return_shock_vol_window debe ser > 1.")
 
         self.window = window
         self.z_threshold = z_threshold
@@ -76,6 +89,8 @@ class MeanReversionStrategy:
         self.regime_timeframe = regime_timeframe
         self.regime_ema_window = regime_ema_window
         self.regime_slope_lookback = regime_slope_lookback
+        self.shock1h_threshold = shock1h_threshold
+        self.return_shock_vol_window = return_shock_vol_window
 
     @staticmethod
     def _timeframe_delta(timeframe: str) -> pd.Timedelta:
@@ -310,9 +325,40 @@ class MeanReversionStrategy:
         result["std"] = result["close"].rolling(
             self.window,
             min_periods=self.window,
-        ).std()
-        result["std"] = result["std"].replace(0.0, np.nan)
-        result["z_score"] = (result["close"] - result["sma"]) / result["std"]
+        ).std().replace(0.0, np.nan)
+        result["z_score"] = calculate_zscore(result["close"], self.window)
+        result["z_previous"] = result["z_score"].shift(1)
+        result["z_long_confirmed"] = confirmed_downside_reentry(
+            result["z_score"], self.z_threshold
+        )
+        result["z_short_confirmed"] = confirmed_upside_reentry(
+            result["z_score"], self.z_threshold
+        )
+        # Generic alias used by journals/tests.
+        result["z_confirmed"] = result["z_long_confirmed"]
+
+        shock_return, shock_volatility, shock_score = standardized_log_return_shock(
+            result["close"],
+            horizon_bars=1,
+            vol_window_bars=self.return_shock_vol_window,
+        )
+        result["shock1h_return"] = shock_return
+        result["shock1h_volatility"] = shock_volatility
+        result["shock1h_score"] = shock_score
+        result["shock1h_previous"] = result["shock1h_score"].shift(1)
+        if self.shock1h_threshold is None:
+            result["shock1h_long_confirmed"] = False
+            result["shock1h_short_confirmed"] = False
+        else:
+            result["shock1h_long_confirmed"] = confirmed_downside_reentry(
+                result["shock1h_score"], self.shock1h_threshold
+            )
+            result["shock1h_short_confirmed"] = confirmed_upside_reentry(
+                result["shock1h_score"], self.shock1h_threshold
+            )
+        # Generic alias for the frozen long path.
+        result["shock1h_confirmed"] = result["shock1h_long_confirmed"]
+
         result["atr"] = self.calculate_atr(result)
 
         result = self._apply_regime(result, regime_df)
@@ -328,17 +374,14 @@ class MeanReversionStrategy:
             ready & (result["z_score"] > self.z_threshold) & short_regime
         )
 
-        previous_z = result["z_score"].shift(1)
         result["entry_long_confirmed"] = (
             ready
-            & (previous_z < -self.z_threshold)
-            & (result["z_score"] >= -self.z_threshold)
+            & result["z_long_confirmed"]
             & long_regime
         )
         result["entry_short_confirmed"] = (
             ready
-            & (previous_z > self.z_threshold)
-            & (result["z_score"] <= self.z_threshold)
+            & result["z_short_confirmed"]
             & short_regime
         )
 
@@ -348,6 +391,14 @@ class MeanReversionStrategy:
         else:
             result["entry_long"] = result["entry_long_confirmed"]
             result["entry_short"] = result["entry_short_confirmed"]
+
+        if self.shock1h_threshold is not None:
+            result["entry_long"] = (
+                result["entry_long"] & result["shock1h_long_confirmed"]
+            )
+            result["entry_short"] = (
+                result["entry_short"] & result["shock1h_short_confirmed"]
+            )
 
         result["exit_long_mean"] = ready & (result["z_score"] >= self.mean_exit_z)
         result["exit_short_mean"] = ready & (

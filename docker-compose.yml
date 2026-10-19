@@ -1,7 +1,7 @@
 services:
   trading-bot:
     build: .
-    container_name: mean-reversion-bot-v10-2
+    container_name: mean-reversion-bot-v12
     restart: unless-stopped
     env_file:
       - .env

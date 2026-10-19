@@ -1,115 +1,67 @@
-# mean-reversion-bot - V10.4
+# mean-reversion-bot — V12
 
-V10.4 is the only research version kept in the repository. Live/Demo execution remains unchanged while research studies one question: can the frozen `z-score + shock1h` edge be replicated across additional liquid USD-M perpetuals to raise trade frequency without destroying PF?
+This repository contains only the active V12 forward-validation bot. Historical selection/sizing scripts and stopped forward versions are intentionally not kept in the working tree.
 
-## Live / Demo
+## Frozen portfolio
 
-Live remains unchanged and is not auto-promoted by V10.4:
+| Component | Side | Risk/trade |
+| --- | --- | ---: |
+| BTC/USDT:USDT | LONG | 0.75% |
+| BNB/USDT:USDT | LONG | 0.50% |
+| DOT/USDT:USDT | SHORT | 0.75% |
+| ADA/USDT:USDT | SHORT | 0.50% |
 
-- BTC/USDT:USDT, LONG only;
-- confirmed z-score re-entry, window 20 / threshold 2.2;
-- regime 1h SMA200 + 4h EMA200;
-- LIMIT postOnly at -3 bp, wait 7 minutes;
-- MARKET fallback only inside the +5 bp no-chase cap;
-- SL = 1.5 ATR from actual fill;
-- TP = fixed RR 1.8, reduceOnly maker LIMIT;
-- risk/trade = 0.5%; max position = 30%; isolated 2x.
+Portfolio constraints are code-frozen:
 
-## Frozen V10.4 research signal
+- max position: 50%
+- max aggregate planned risk: 1.50%
+- max concurrent positions: 3
+- Demo only (`USE_TESTNET=True`)
 
-Every market uses exactly the same 1h setup:
+Signal/execution contract:
 
-```text
-confirmed z-score re-entry: z[t-1] < -2.2 and z[t] >= -2.2
-AND
-confirmed normalized 1-hour downside-shock re-entry at threshold 2.175
-```
+- timeframe: 1h
+- z-score: 20 / 2.2
+- normalized 1h shock: 2.175 / 100
+- regime: 1h SMA200 + 4h EMA200
+- ATR: 14; stop: 1.5 ATR
+- RR: 1.8
+- pullback LIMIT: 3 bp; wait 7 min; no-chase cap 5 bp
+- LONG and SHORT require z-score and shock confirmation on the same closed candle
 
-No threshold, timeframe, RR, ATR, regime, sizing or execution parameter is retuned per asset.
-
-## Cross-asset universe
-
-The reference portfolio from V10.3 is BTC + BNB. V10.4 adds a pre-registered expansion basket:
-
-```text
-BTC, BNB,
-SOL, DOGE, ADA, LINK, AVAX, BCH, TRX, DOT
-```
-
-ETH/LTC/XRP are not in the default V10.4 basket because V10.3 already rejected them individually with the same frozen signal.
-
-## Component gate
-
-Every market must demonstrate edge independently before it can enter the expansion path:
-
-```dotenv
-V10_4_MIN_COMPONENT_TRADES=20
-V10_4_MIN_COMPONENT_PF=1.20
-V10_4_COMPONENT_DD_LIMIT=0.10
-V10_4_MIN_POSITIVE_YEARS=3
-```
-
-## Portfolio construction rule
-
-V10.4 deliberately avoids an exhaustive subset search.
-
-1. Start from the individually-qualified reference symbols (BTC + BNB).
-2. Rank only the newly-qualified assets by individual PF.
-3. Add them one by one in that fixed ranking.
-4. The **first** sequential step that reaches all portfolio gates is the historical forward-test candidate.
-5. Later combinations are not allowed to replace it simply because they backtest better.
-
-Portfolio gates:
-
-```dotenv
-V10_4_TARGET_MIN_TRADES_PER_YEAR=24
-V10_4_TARGET_MAX_TRADES_PER_YEAR=40
-V10_4_PORTFOLIO_MIN_PF=1.60
-V10_4_PORTFOLIO_DD_LIMIT=0.07
-V10_4_MIN_PORTFOLIO_POSITIVE_YEARS=4
-```
-
-V10.4 also reports trades/month plus median, P90 and maximum days between entries so frequency is measured as actual cadence, not just an annual average.
-
-## Statistical status
-
-The BTC signal thresholds were discovered after inspecting 2022+, so 2022+ is not a fresh temporal holdout. The new assets are useful cross-sectional external tests because their data was not used to derive those BTC thresholds, but any portfolio selected by V10.4 still requires fresh forward validation.
-
-`promotion_to_live` therefore remains `false`.
-
-## Funding reproducibility
-
-Funding is snapshotted per symbol under `state/funding/` with SHA-256 metadata. Historical rows are immutable; later runs may append only new tail rows. Gaps or historical modifications fail closed.
-
-To deliberately rebuild snapshots:
+## Setup
 
 ```bash
-python backtest_v10_4.py --rebuild-funding
+cp .env.example .env
 ```
 
-Do not use this casually if exact reproducibility matters.
+Set the Binance Demo credentials and set `V12_START_UTC` **once** to the first full 1h candle after deployment. Never move that boundary after the forward starts.
+
+The runtime uses clean generic files:
+
+- `state/forward.jsonl`
+- `state/execution_journal.jsonl`
+- `state/bot_state_<symbol>.json`
+
+Market-data caches live below `state/history`, `state/minute` and `state/funding`. They are reusable inputs, not experiment outputs.
 
 ## Run
 
 ```bash
-python -m pip install -r requirements-dev.txt
 python -m pytest -q
-python backtest_v10_4.py
+python main.py
 ```
 
-The first run may download 1h/4h history, funding and selected 1m execution windows for the new assets. Subsequent runs reuse caches.
+The bot fails closed if the frozen contract drifts, if Demo mode is disabled, or if `V12_START_UTC` is missing/invalid.
 
-## Outputs
+## Forward report
 
-Only V10.4 research artifacts are produced:
+```bash
+python forward_report.py
+```
 
-- `state/backtest_v10_4_markets.csv`
-- `state/backtest_v10_4_expansion.csv`
-- `state/backtest_v10_4_portfolios.csv`
-- `state/backtest_v10_4_annual.csv`
-- `state/backtest_v10_4_opportunities.csv`
-- `state/backtest_v10_4_sensitivity.csv`
-- `state/backtest_v10_4_stress.csv`
-- `state/backtest_v10_4_recommendation.json`
+The report replays the frozen V12 signal on mainnet market data from `V12_START_UTC`, reports each component, a BTC+BNB baseline, the complete V12 portfolio, and Demo execution diagnostics. Demo fills/slippage are operational diagnostics only; they are not evidence of real mainnet execution quality.
 
-Old V9/V10/V10.1/V10.2/V10.3 generated research artifacts are deleted automatically. Historical/minute/funding caches, live state and execution journals are preserved.
+## State hygiene
+
+Generated research/old-forward artifacts are intentionally ignored by Git. When migrating to this clean tree, remove old generated files while keeping only the reusable market-data caches. The patch release instructions provide the exact cleanup command.

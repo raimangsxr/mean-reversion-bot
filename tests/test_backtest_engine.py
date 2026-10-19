@@ -139,3 +139,44 @@ def test_walk_forward_period_excludes_trade_that_closes_after_end():
 def test_portfolio_config_name_is_deterministic_for_research_grid():
     cfg = PortfolioConfig("fixed_rr", 1.8, 0.005, 0.30, "long_only")
     assert cfg.name == "fixed_rr|rr=1.8|risk=0.0050|maxpos=0.30|long_only"
+
+
+def test_component_risk_override_changes_notional_without_dropping_trade():
+    opp = pd.DataFrame([
+        {
+            "component": "BTC/USDT:USDT@1h:long",
+            "symbol": "BTC/USDT:USDT", "side": "long", "exit_policy": "fixed_rr", "rr": 1.8,
+            "entry_time": pd.Timestamp("2026-01-01T00:00:00Z"),
+            "exit_time": pd.Timestamp("2026-01-01T01:00:00Z"),
+            "entry_price": 100.0, "stop_fraction": 0.01,
+            "net_pnl_per_unit": 1.0, "funding_pnl_per_unit": 0.0,
+            "fee_per_unit": 0.0, "slippage_per_unit": 0.0,
+            "exit_reason": "take_profit", "mae_r": 0.1,
+        },
+        {
+            "component": "BNB/USDT:USDT@1h:long",
+            "symbol": "BNB/USDT:USDT", "side": "long", "exit_policy": "fixed_rr", "rr": 1.8,
+            "entry_time": pd.Timestamp("2026-01-02T00:00:00Z"),
+            "exit_time": pd.Timestamp("2026-01-02T01:00:00Z"),
+            "entry_price": 100.0, "stop_fraction": 0.01,
+            "net_pnl_per_unit": 1.0, "funding_pnl_per_unit": 0.0,
+            "fee_per_unit": 0.0, "slippage_per_unit": 0.0,
+            "exit_reason": "take_profit", "mae_r": 0.1,
+        },
+    ])
+    cfg = PortfolioConfig("fixed_rr", 1.8, 0.005, 1.0, "long_short")
+    result = simulate_portfolio(
+        opp,
+        cfg,
+        start=pd.Timestamp("2026-01-01T00:00:00Z"),
+        end=pd.Timestamp("2026-12-31T23:59:59Z"),
+        prefiltered_config=True,
+        risk_per_trade_by_component={
+            "BTC/USDT:USDT@1h:long": 0.0075,
+            "BNB/USDT:USDT@1h:long": 0.0025,
+        },
+    )
+    assert len(result.trades) == 2
+    btc = result.trades[result.trades["symbol"].eq("BTC/USDT:USDT")].iloc[0]
+    bnb = result.trades[result.trades["symbol"].eq("BNB/USDT:USDT")].iloc[0]
+    assert btc["notional"] > bnb["notional"] * 2.9
