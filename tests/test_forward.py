@@ -116,6 +116,10 @@ def test_forward_sizing_is_frozen():
     assert settings.MAX_POSITION_PCT == 0.50
     assert settings.MAX_PORTFOLIO_RISK_PCT == 0.015
     assert settings.MAX_CONCURRENT_POSITIONS == 3
+    assert settings.ORDERFLOW_DECISION_SECONDS == 60
+    assert settings.ORDERFLOW_IMBALANCE_THRESHOLD == 0.20
+    assert settings.ORDERFLOW_ADVERSE_ACCEPTANCE_BPS == 5.0
+    assert settings.ORDERFLOW_TOTAL_ENTRY_DEADLINE_SECONDS == 420
 
 
 def test_forward_validator_requires_own_start(monkeypatch):

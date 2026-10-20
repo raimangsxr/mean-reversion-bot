@@ -46,6 +46,8 @@ from config.settings import (
     REGIME_MODE,
     REGIME_SLOPE_LOOKBACK,
     REGIME_TIMEFRAME,
+    RETURN_SHOCK_VOL_WINDOW,
+    SHOCK1H_THRESHOLD,
     TIMEFRAME,
     TREND_WINDOW,
     Z_THRESHOLD,
@@ -762,17 +764,22 @@ def fetch_market_tick_size(symbol: str) -> float:
 # -----------------------------------------------------------------------------
 # Signal construction.
 # -----------------------------------------------------------------------------
-def build_signals(symbol: str) -> pd.DataFrame:
+def build_signals(
+    symbol: str,
+    *,
+    start: str = BACKTEST_START,
+    end: str = BACKTEST_END,
+) -> pd.DataFrame:
     # Import lazy para que tests de logica no requieran CCXT.
     from src.data.fetcher import fetch_binance_history_cached
 
-    print(f"{symbol}: historia {TIMEFRAME} cache/incremental {BACKTEST_START} -> {BACKTEST_END}")
+    print(f"{symbol}: historia {TIMEFRAME} cache/incremental {start} -> {end}")
     df = fetch_binance_history_cached(
-        symbol, TIMEFRAME, BACKTEST_START, BACKTEST_END, BACKTEST_HISTORY_CACHE_DIR
+        symbol, TIMEFRAME, start, end, BACKTEST_HISTORY_CACHE_DIR
     )
     print(f"{symbol}: historia {REGIME_TIMEFRAME} cache/incremental para regimen")
     regime_df = fetch_binance_history_cached(
-        symbol, REGIME_TIMEFRAME, BACKTEST_START, BACKTEST_END, BACKTEST_HISTORY_CACHE_DIR
+        symbol, REGIME_TIMEFRAME, start, end, BACKTEST_HISTORY_CACHE_DIR
     )
     min_rows = max(TREND_WINDOW, LOOKBACK_WINDOW, ATR_WINDOW) + 50
     if len(df) < min_rows:
@@ -788,6 +795,8 @@ def build_signals(symbol: str) -> pd.DataFrame:
         regime_timeframe=REGIME_TIMEFRAME,
         regime_ema_window=REGIME_EMA_WINDOW,
         regime_slope_lookback=REGIME_SLOPE_LOOKBACK,
+        shock1h_threshold=SHOCK1H_THRESHOLD,
+        return_shock_vol_window=RETURN_SHOCK_VOL_WINDOW,
     )
     return strategy.calculate_signals(df, regime_df=regime_df)
 

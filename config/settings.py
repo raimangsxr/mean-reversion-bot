@@ -96,6 +96,17 @@ RISK_BY_SYMBOL = {spec[0]: spec[2] for spec in COMPONENT_SPECS}
 MAX_POSITION_PCT = 0.50
 MAX_PORTFOLIO_RISK_PCT = 0.015
 MAX_CONCURRENT_POSITIONS = 3
+
+# Frozen causal executed-flow gate. These are code constants, not tunable env vars.
+ORDERFLOW_DECISION_SECONDS = 60
+ORDERFLOW_IMBALANCE_THRESHOLD = 0.20
+ORDERFLOW_ADVERSE_ACCEPTANCE_BPS = 5.0
+ORDERFLOW_ABSORPTION_TOLERANCE_BPS = 2.0
+ORDERFLOW_TOTAL_ENTRY_DEADLINE_SECONDS = 420
+# Operational grace only: if complete WebSocket coverage cannot be proven shortly
+# after t+60s, the signal fails closed rather than trading on partial flow.
+ORDERFLOW_COVERAGE_GRACE_SECONDS = 10
+
 FORWARD_ONLY_DEMO = _env_bool("FORWARD_ONLY_DEMO", True)
 FORWARD_EXPERIMENT_ID = os.getenv("FORWARD_EXPERIMENT_ID", "v12").strip()
 FORWARD_START_UTC = os.getenv("V12_START_UTC", "").strip()
@@ -130,6 +141,11 @@ def frozen_config() -> dict[str, object]:
         "max_position_pct": MAX_POSITION_PCT,
         "max_portfolio_risk_pct": MAX_PORTFOLIO_RISK_PCT,
         "max_concurrent_positions": MAX_CONCURRENT_POSITIONS,
+        "orderflow_decision_seconds": ORDERFLOW_DECISION_SECONDS,
+        "orderflow_imbalance_threshold": ORDERFLOW_IMBALANCE_THRESHOLD,
+        "orderflow_adverse_acceptance_bps": ORDERFLOW_ADVERSE_ACCEPTANCE_BPS,
+        "orderflow_total_entry_deadline_seconds": ORDERFLOW_TOTAL_ENTRY_DEADLINE_SECONDS,
+        "orderflow_coverage_grace_seconds": ORDERFLOW_COVERAGE_GRACE_SECONDS,
         "break_even_trigger_r": BREAK_EVEN_TRIGGER_R,
         "partial_tp_trigger_r": PARTIAL_TP_TRIGGER_R,
         "forward_only_demo": FORWARD_ONLY_DEMO,
@@ -235,6 +251,18 @@ def validate_forward_settings() -> None:
         raise ValueError("V12 portfolio risk cap is frozen at 1.5%.")
     if MAX_CONCURRENT_POSITIONS != 3:
         raise ValueError("V12 max concurrency is frozen at 3.")
+    if ORDERFLOW_DECISION_SECONDS != 60:
+        raise ValueError("V12 order-flow decision delay is frozen at 60s.")
+    if ORDERFLOW_IMBALANCE_THRESHOLD != 0.20:
+        raise ValueError("V12 order-flow imbalance threshold is frozen at 20%.")
+    if ORDERFLOW_ADVERSE_ACCEPTANCE_BPS != 5.0:
+        raise ValueError("V12 adverse-acceptance threshold is frozen at 5bp.")
+    if ORDERFLOW_TOTAL_ENTRY_DEADLINE_SECONDS != 420:
+        raise ValueError("V12 total entry deadline is frozen at 420s.")
+    if ORDERFLOW_TOTAL_ENTRY_DEADLINE_SECONDS != ENTRY_LIMIT_WAIT_SECONDS:
+        raise ValueError("Order-flow total deadline must equal ENTRY_LIMIT_WAIT_SECONDS.")
+    if ORDERFLOW_COVERAGE_GRACE_SECONDS < 0:
+        raise ValueError("ORDERFLOW_COVERAGE_GRACE_SECONDS cannot be negative.")
     if not FORWARD_ONLY_DEMO:
         raise ValueError("V12 requires FORWARD_ONLY_DEMO=True.")
     if not USE_TESTNET:

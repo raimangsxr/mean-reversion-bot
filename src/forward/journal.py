@@ -47,6 +47,22 @@ class ForwardJournal:
             ) from exc
         return seen
 
+    def records(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+        except Exception as exc:
+            raise ForwardJournalError(
+                f"No se puede leer el forward journal {self.path}: {exc}"
+            ) from exc
+        return records
+
     def append_once(self, event: str, idempotency_key: str, **payload: Any) -> bool:
         if idempotency_key in self._seen:
             return False

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import math
 import re
@@ -44,6 +44,8 @@ from config.settings import (
     MAX_CONCURRENT_POSITIONS,
     MAX_PORTFOLIO_RISK_PCT,
     MAX_POSITION_PCT,
+    ORDERFLOW_COVERAGE_GRACE_SECONDS,
+    ORDERFLOW_DECISION_SECONDS,
     RISK_BY_SYMBOL,
     SIDE_BY_SYMBOL,
     FORWARD_START_UTC,
@@ -57,7 +59,15 @@ from config.settings import (
 from src.data.fetcher import fetch_binance_klines, timeframe_to_timedelta
 from src.execution.engine import BinanceExecutionEngine, ExecutionError
 from src.forward.config import canonical_config_sha256
+from src.forward.gate import (
+    ArmedSignal,
+    create_armed_signal,
+    journal_arm,
+    journal_flow_decision,
+    recover_armed_signals,
+)
 from src.forward.journal import ForwardJournal
+from src.forward.orderflow import AggTradeCollector, FlowDecision
 from src.risk.manager import RiskManager
 from src.strategy.mean_reversion import MeanReversionStrategy
 
@@ -293,6 +303,371 @@ def _journal_decision(
     )
 
 
+def _block_armed_signal(
+    *,
+    journal: ForwardJournal,
+    ctx: LiveContext,
+    arm: ArmedSignal,
+    config_sha256: str,
+    reason: str,
+    flow_class: str,
+    flow: FlowDecision | None = None,
+    collector_status: dict[str, object] | None = None,
+) -> None:
+    engine = _require_engine(ctx)
+    journal_flow_decision(
+        journal,
+        arm,
+        config_sha256=config_sha256,
+        flow=flow,
+        flow_class=flow_class,
+        veto=True,
+        reason=reason,
+        collector_status=collector_status,
+    )
+    _journal_decision(
+        journal,
+        ctx,
+        arm.signal_time,
+        "vetoed" if flow_class == "adverse_acceptance" else "blocked",
+        config_sha256=config_sha256,
+        reason=reason,
+        orderflow_class=flow_class,
+        orderflow_veto=True,
+    )
+    engine.mark_signal_processed(arm.signal_time)
+
+
+def _process_ready_armed_signals(
+    armed: dict[str, ArmedSignal],
+    *,
+    contexts: dict[str, LiveContext],
+    states: dict[str, dict],
+    journal: ForwardJournal,
+    collector: AggTradeCollector,
+    config_sha256: str,
+    global_fail_closed: bool,
+) -> None:
+    now = datetime.now(timezone.utc)
+    for key, arm in sorted(list(armed.items()), key=lambda item: item[1].decision_at):
+        if now < arm.decision_at:
+            continue
+
+        ctx = contexts[arm.symbol]
+        engine = _require_engine(ctx)
+        risk = _require_risk(ctx)
+
+        if now >= arm.deadline_at:
+            _block_armed_signal(
+                journal=journal,
+                ctx=ctx,
+                arm=arm,
+                config_sha256=config_sha256,
+                reason="orderflow_deadline_elapsed",
+                flow_class="expired",
+                collector_status=collector.status(),
+            )
+            armed.pop(key, None)
+            continue
+
+        if not collector.has_complete_window(
+            arm.symbol,
+            arm.decision_start,
+            arm.decision_at,
+        ):
+            grace_deadline = arm.decision_at + timedelta(
+                seconds=ORDERFLOW_COVERAGE_GRACE_SECONDS
+            )
+            if now < grace_deadline:
+                continue
+            _block_armed_signal(
+                journal=journal,
+                ctx=ctx,
+                arm=arm,
+                config_sha256=config_sha256,
+                reason="incomplete_orderflow_window",
+                flow_class="missing",
+                collector_status=collector.status(),
+            )
+            print(
+                f"{arm.symbol}: incomplete order-flow coverage; "
+                "signal vetoed fail-closed."
+            )
+            armed.pop(key, None)
+            continue
+
+        try:
+            flow = collector.decide(
+                arm.symbol,
+                side=arm.side,
+                start=arm.decision_start,
+                window_seconds=ORDERFLOW_DECISION_SECONDS,
+            )
+        except Exception as exc:
+            _block_armed_signal(
+                journal=journal,
+                ctx=ctx,
+                arm=arm,
+                config_sha256=config_sha256,
+                reason=f"orderflow_decision_error:{type(exc).__name__}",
+                flow_class="missing",
+                collector_status=collector.status(),
+            )
+            print(f"{arm.symbol}: order-flow decision failed closed: {exc}")
+            armed.pop(key, None)
+            continue
+
+        journal_flow_decision(
+            journal,
+            arm,
+            config_sha256=config_sha256,
+            flow=flow,
+            flow_class=flow.orderflow_class,
+            veto=flow.veto,
+            collector_status=collector.status(),
+        )
+        if flow.veto:
+            _journal_decision(
+                journal,
+                ctx,
+                arm.signal_time,
+                "vetoed",
+                config_sha256=config_sha256,
+                reason="adverse_acceptance",
+                orderflow_class=flow.orderflow_class,
+                orderflow_veto=True,
+                delay_reference_price=flow.reference_price,
+                **flow.features,
+            )
+            engine.mark_signal_processed(arm.signal_time)
+            print(
+                f"{arm.symbol}: {arm.side.upper()} vetoed by adverse acceptance | "
+                f"imb={flow.features.get('of_60s_side_imbalance')} | "
+                f"ret={flow.features.get('of_60s_side_return_bps')}bp"
+            )
+            armed.pop(key, None)
+            continue
+
+        st = states.get(arm.symbol, {})
+        if st.get("entry_pending") or st.get("has_position"):
+            _journal_decision(
+                journal,
+                ctx,
+                arm.signal_time,
+                "blocked",
+                config_sha256=config_sha256,
+                reason="existing_position_or_pending_entry",
+                orderflow_class=flow.orderflow_class,
+            )
+            engine.mark_signal_processed(arm.signal_time)
+            armed.pop(key, None)
+            continue
+        if global_fail_closed:
+            _journal_decision(
+                journal,
+                ctx,
+                arm.signal_time,
+                "blocked",
+                config_sha256=config_sha256,
+                reason="portfolio_fail_closed",
+                orderflow_class=flow.orderflow_class,
+            )
+            engine.mark_signal_processed(arm.signal_time)
+            armed.pop(key, None)
+            continue
+        if _active_count(states) >= MAX_CONCURRENT_POSITIONS:
+            _journal_decision(
+                journal,
+                ctx,
+                arm.signal_time,
+                "blocked",
+                config_sha256=config_sha256,
+                reason="max_concurrent_positions",
+                orderflow_class=flow.orderflow_class,
+            )
+            engine.mark_signal_processed(arm.signal_time)
+            armed.pop(key, None)
+            continue
+
+        if not math.isfinite(arm.atr) or arm.atr <= 0:
+            raise RuntimeError(f"{arm.symbol}: invalid armed ATR {arm.atr}")
+        market_price = engine.get_market_price(arm.symbol)
+        account = engine.get_account_snapshot("USDT")
+        plan = risk.build_plan(
+            side=arm.side,
+            account_equity=account.equity,
+            free_margin=account.free_margin,
+            expected_entry_price=market_price,
+            atr=arm.atr,
+            leverage=LEVERAGE,
+        )
+
+        existing_risk = _aggregate_risk(states)
+        risk_room = max(
+            0.0,
+            account.equity * MAX_PORTFOLIO_RISK_PCT - existing_risk,
+        )
+        if risk_room <= 0:
+            _journal_decision(
+                journal,
+                ctx,
+                arm.signal_time,
+                "blocked",
+                config_sha256=config_sha256,
+                reason="portfolio_risk",
+                portfolio_existing_risk=existing_risk,
+                portfolio_risk_room=risk_room,
+                orderflow_class=flow.orderflow_class,
+            )
+            engine.mark_signal_processed(arm.signal_time)
+            armed.pop(key, None)
+            continue
+
+        requested_amount = plan.base_amount
+        if plan.estimated_risk > risk_room:
+            requested_amount = risk_room / plan.stop_distance
+        amount = engine.normalize_amount(
+            arm.symbol,
+            base_amount=requested_amount,
+            price=market_price,
+        )
+        actual_risk = amount * plan.stop_distance
+        if actual_risk <= 0 or actual_risk > risk_room * 1.001:
+            _journal_decision(
+                journal,
+                ctx,
+                arm.signal_time,
+                "blocked",
+                config_sha256=config_sha256,
+                reason="sizing_outside_portfolio_risk",
+                estimated_risk=actual_risk,
+                portfolio_risk_room=risk_room,
+                orderflow_class=flow.orderflow_class,
+            )
+            engine.mark_signal_processed(arm.signal_time)
+            armed.pop(key, None)
+            continue
+
+        remaining_wait = int(
+            (arm.deadline_at - datetime.now(timezone.utc)).total_seconds()
+        )
+        if remaining_wait <= 0:
+            _block_armed_signal(
+                journal=journal,
+                ctx=ctx,
+                arm=arm,
+                config_sha256=config_sha256,
+                reason="orderflow_deadline_elapsed_before_submit",
+                flow_class="expired",
+                flow=flow,
+                collector_status=collector.status(),
+            )
+            armed.pop(key, None)
+            continue
+
+        use_tp = EXIT_MODE in TP_EXIT_MODES
+        context = {
+            "strategy_version": STRATEGY_VERSION,
+            "experiment_id": FORWARD_EXPERIMENT_ID,
+            "config_sha256": config_sha256,
+            "build_sha": BUILD_SHA or None,
+            "signal_time": arm.signal_time,
+            "signal_close": arm.signal_close,
+            "signal_z": arm.z_score,
+            "signal_shock1h": arm.shock1h_score,
+            "atr": arm.atr,
+            "regime_mode": REGIME_MODE,
+            "expected_entry_price": market_price,
+            "risk_reward_ratio": RISK_REWARD_RATIO,
+            "risk_budget": plan.risk_budget,
+            "estimated_risk": actual_risk,
+            "risk_utilization": (
+                actual_risk / plan.risk_budget if plan.risk_budget else 0.0
+            ),
+            "limiting_factor": (
+                "portfolio_risk"
+                if actual_risk + 1e-12 < plan.estimated_risk
+                else plan.limiting_factor
+            ),
+            "portfolio_existing_risk": existing_risk,
+            "portfolio_risk_room": risk_room,
+            "exit_mode": EXIT_MODE,
+            "orderflow_class": flow.orderflow_class,
+            "orderflow_reference_price": flow.reference_price,
+            "orderflow_decision_seconds": ORDERFLOW_DECISION_SECONDS,
+            **flow.features,
+        }
+        _journal_decision(
+            journal,
+            ctx,
+            arm.signal_time,
+            "approved",
+            config_sha256=config_sha256,
+            side=arm.side,
+            amount=amount,
+            estimated_risk=actual_risk,
+            portfolio_existing_risk=existing_risk,
+            portfolio_risk_room=risk_room,
+            orderflow_class=flow.orderflow_class,
+            orderflow_veto=False,
+            delay_reference_price=flow.reference_price,
+            remaining_entry_seconds=remaining_wait,
+        )
+
+        result = engine.submit_passive_entry(
+            symbol=arm.symbol,
+            side=arm.side,
+            amount=amount,
+            reference_price=flow.reference_price,
+            fallback_reference_price=flow.reference_price,
+            limit_offset_bps=ENTRY_LIMIT_OFFSET_BPS,
+            wait_seconds=remaining_wait,
+            fallback_cap_bps=ENTRY_FALLBACK_CAP_BPS,
+            fallback_max_lateness_seconds=ENTRY_FALLBACK_MAX_LATENESS_SECONDS,
+            stop_distance=plan.stop_distance,
+            risk_reward_ratio=RISK_REWARD_RATIO,
+            use_take_profit=use_tp,
+            signal_timestamp=arm.signal_time,
+            journal_context=context,
+        )
+        journal.append_once(
+            "order_submitted",
+            f"order:{arm.symbol}:{arm.signal_time}",
+            experiment_id=FORWARD_EXPERIMENT_ID,
+            strategy_version=STRATEGY_VERSION,
+            config_sha256=config_sha256,
+            symbol=arm.symbol,
+            signal_time=arm.signal_time,
+            side=arm.side,
+            amount=amount,
+            orderflow_class=flow.orderflow_class,
+            orderflow_reference_price=flow.reference_price,
+            remaining_entry_seconds=remaining_wait,
+        )
+        states[arm.symbol] = {
+            "known": True,
+            "has_position": False,
+            "entry_pending": True,
+            "state": result["state"],
+        }
+        print(
+            f"{arm.symbol}: {arm.side.upper()} order-flow approved | "
+            f"class={flow.orderflow_class} ref={flow.reference_price:.8g} | "
+            f"risk~{actual_risk:.2f} | remaining={remaining_wait}s"
+        )
+        armed.pop(key, None)
+
+
+def _seconds_until_armed_action(armed: dict[str, ArmedSignal]) -> float | None:
+    if not armed:
+        return None
+    now = datetime.now(timezone.utc)
+    next_at = min(arm.decision_at for arm in armed.values())
+    if next_at <= now:
+        return 0.25
+    return max(0.25, min(5.0, (next_at - now).total_seconds()))
+
+
 def _maybe_arm_break_even(ctx: LiveContext, position_state: dict) -> None:
     if not position_state.get("has_position"):
         return
@@ -422,6 +797,19 @@ def main() -> None:
         frozen_config=frozen_contract,
     )
 
+    collector = AggTradeCollector(SYMBOLS)
+    collector.start()
+    if collector.wait_until_connected(timeout=15.0):
+        print(f"Order-flow stream connected: {collector.url}")
+    else:
+        print(
+            "Warning: order-flow stream is not connected yet. "
+            "Signals will fail closed unless complete 60s coverage is proven."
+        )
+    armed = recover_armed_signals(journal, config_sha256=config_sha256)
+    if armed:
+        print(f"Recovered {len(armed)} unresolved order-flow armed signal(s).")
+
     sizing = ", ".join(
         f"{symbol} {SIDE_BY_SYMBOL[symbol][0].upper()}={RISK_BY_SYMBOL[symbol]:.2%}"
         for symbol in SYMBOLS
@@ -541,15 +929,15 @@ def main() -> None:
                         f"BE={state.break_even_armed}"
                     )
 
-                # New entries. Every generated primary signal receives an
-                # auditable decision, including blocked signals.
+                # Arm every frozen V12 signal first. Portfolio occupancy/risk is
+                # evaluated only after the causal 60s observation window, matching
+                # the historical order-flow replay.
                 if in_window:
                     for symbol, ctx in primary_contexts.items():
                         latest = latest_by_symbol.get(symbol)
                         if latest is None:
                             continue
                         engine = _require_engine(ctx)
-                        risk = _require_risk(ctx)
                         signal_ts = latest.name.isoformat()
                         if engine.was_signal_processed(signal_ts):
                             continue
@@ -559,205 +947,43 @@ def main() -> None:
                             engine.mark_signal_processed(signal_ts)
                             continue
 
-                        st = states.get(symbol, {})
-                        if st.get("entry_pending") or st.get("has_position"):
-                            _journal_decision(
-                                journal,
-                                ctx,
-                                signal_ts,
-                                "blocked",
-                                config_sha256=config_sha256,
-                                reason="existing_position_or_pending_entry",
-                            )
-                            engine.mark_signal_processed(signal_ts)
+                        key = f"{symbol}|{signal_ts}"
+                        if key in armed:
                             continue
-
-                        if global_fail_closed:
-                            _journal_decision(
-                                journal,
-                                ctx,
-                                signal_ts,
-                                "blocked",
-                                config_sha256=config_sha256,
-                                reason="portfolio_fail_closed",
-                            )
-                            engine.mark_signal_processed(signal_ts)
-                            continue
-
-                        candle_close_time = latest.name + timeframe_to_timedelta(TIMEFRAME)
-                        age_seconds = (
-                            datetime.now(timezone.utc) - candle_close_time.to_pydatetime()
-                        ).total_seconds()
-                        if age_seconds > SIGNAL_MAX_AGE_SECONDS:
-                            _journal_decision(
-                                journal,
-                                ctx,
-                                signal_ts,
-                                "blocked",
-                                config_sha256=config_sha256,
-                                reason="stale_signal",
-                                signal_age_seconds=age_seconds,
-                            )
-                            engine.mark_signal_processed(signal_ts)
-                            print(f"{symbol}: signal discarded as stale ({age_seconds:.0f}s)")
-                            continue
-
-                        if _active_count(states) >= MAX_CONCURRENT_POSITIONS:
-                            _journal_decision(
-                                journal,
-                                ctx,
-                                signal_ts,
-                                "blocked",
-                                config_sha256=config_sha256,
-                                reason="max_concurrent_positions",
-                            )
-                            engine.mark_signal_processed(signal_ts)
-                            print(f"{symbol}: signal blocked by concurrency limit.")
-                            continue
-
-                        atr = float(latest["atr"])
-                        if not math.isfinite(atr) or atr <= 0:
-                            raise RuntimeError(f"{symbol}: invalid ATR {atr}")
-                        market_price = engine.get_market_price(symbol)
-                        account = engine.get_account_snapshot("USDT")
-                        plan = risk.build_plan(
-                            side=side,
-                            account_equity=account.equity,
-                            free_margin=account.free_margin,
-                            expected_entry_price=market_price,
-                            atr=atr,
-                            leverage=LEVERAGE,
-                        )
-
-                        existing_risk = _aggregate_risk(states)
-                        risk_room = max(
-                            0.0,
-                            account.equity * MAX_PORTFOLIO_RISK_PCT - existing_risk,
-                        )
-                        if risk_room <= 0:
-                            _journal_decision(
-                                journal,
-                                ctx,
-                                signal_ts,
-                                "blocked",
-                                config_sha256=config_sha256,
-                                reason="portfolio_risk",
-                                portfolio_existing_risk=existing_risk,
-                                portfolio_risk_room=risk_room,
-                            )
-                            engine.mark_signal_processed(signal_ts)
-                            print(f"{symbol}: signal blocked; no portfolio risk room.")
-                            continue
-
-                        requested_amount = plan.base_amount
-                        if plan.estimated_risk > risk_room:
-                            requested_amount = risk_room / plan.stop_distance
-                        amount = engine.normalize_amount(
-                            symbol,
-                            base_amount=requested_amount,
-                            price=market_price,
-                        )
-                        actual_risk = amount * plan.stop_distance
-                        if actual_risk <= 0 or actual_risk > risk_room * 1.001:
-                            _journal_decision(
-                                journal,
-                                ctx,
-                                signal_ts,
-                                "blocked",
-                                config_sha256=config_sha256,
-                                reason="sizing_outside_portfolio_risk",
-                                estimated_risk=actual_risk,
-                                portfolio_risk_room=risk_room,
-                            )
-                            engine.mark_signal_processed(signal_ts)
-                            print(f"{symbol}: sizing does not fit portfolio risk cap.")
-                            continue
-
-                        use_tp = EXIT_MODE in TP_EXIT_MODES
-                        context = {
-                            "strategy_version": STRATEGY_VERSION,
-                            "experiment_id": FORWARD_EXPERIMENT_ID,
-                            "config_sha256": config_sha256,
-                            "build_sha": BUILD_SHA or None,
-                            "signal_time": signal_ts,
-                            "signal_close": float(latest["close"]),
-                            "signal_z": float(latest.get("z_score", math.nan)),
-                            "signal_shock1h": float(latest.get("shock1h_score", math.nan)),
-                            "atr": atr,
-                            "regime_mode": REGIME_MODE,
-                            "expected_entry_price": market_price,
-                            "risk_reward_ratio": RISK_REWARD_RATIO,
-                            "risk_budget": plan.risk_budget,
-                            "estimated_risk": actual_risk,
-                            "risk_utilization": (
-                                actual_risk / plan.risk_budget if plan.risk_budget else 0.0
-                            ),
-                            "limiting_factor": (
-                                "portfolio_risk"
-                                if actual_risk + 1e-12 < plan.estimated_risk
-                                else plan.limiting_factor
-                            ),
-                            "portfolio_existing_risk": existing_risk,
-                            "portfolio_risk_room": risk_room,
-                            "exit_mode": EXIT_MODE,
-                            "break_even_trigger_r": BREAK_EVEN_TRIGGER_R,
-                            "partial_tp_trigger_r": PARTIAL_TP_TRIGGER_R,
-                        }
-
-                        # Persist approval before any order can be sent. If this
-                        # write fails, the exception prevents execution.
-                        _journal_decision(
-                            journal,
-                            ctx,
-                            signal_ts,
-                            "approved",
-                            config_sha256=config_sha256,
-                            side=side,
-                            amount=amount,
-                            estimated_risk=actual_risk,
-                            portfolio_existing_risk=existing_risk,
-                            portfolio_risk_room=risk_room,
-                        )
-
-                        result = engine.submit_passive_entry(
+                        decision_start = (
+                            latest.name + timeframe_to_timedelta(TIMEFRAME)
+                        ).to_pydatetime()
+                        arm = create_armed_signal(
                             symbol=symbol,
                             side=side,
-                            amount=amount,
-                            reference_price=float(latest["close"]),
-                            fallback_reference_price=market_price,
-                            limit_offset_bps=ENTRY_LIMIT_OFFSET_BPS,
-                            wait_seconds=ENTRY_LIMIT_WAIT_SECONDS,
-                            fallback_cap_bps=ENTRY_FALLBACK_CAP_BPS,
-                            fallback_max_lateness_seconds=ENTRY_FALLBACK_MAX_LATENESS_SECONDS,
-                            stop_distance=plan.stop_distance,
-                            risk_reward_ratio=RISK_REWARD_RATIO,
-                            use_take_profit=use_tp,
-                            signal_timestamp=signal_ts,
-                            journal_context=context,
-                        )
-                        journal.append_once(
-                            "order_submitted",
-                            f"order:{symbol}:{signal_ts}",
-                            experiment_id=FORWARD_EXPERIMENT_ID,
-                            strategy_version=STRATEGY_VERSION,
-                            config_sha256=config_sha256,
-                            symbol=symbol,
+                            risk_per_trade=ctx.risk_per_trade,
                             signal_time=signal_ts,
-                            side=side,
-                            amount=amount,
+                            decision_start=decision_start,
+                            signal_close=float(latest["close"]),
+                            atr=float(latest["atr"]),
+                            z_score=_float_or_none(latest.get("z_score")),
+                            shock1h_score=_float_or_none(latest.get("shock1h_score")),
                         )
-                        states[symbol] = {
-                            "known": True,
-                            "has_position": False,
-                            "entry_pending": True,
-                            "state": result["state"],
-                        }
+                        # Persist ARMED before the process can ever place an order.
+                        journal_arm(journal, arm, config_sha256=config_sha256)
+                        armed[arm.key] = arm
                         print(
-                            f"{symbol}: {side.upper()} pending | "
-                            f"notional~{amount * market_price:.2f} | "
-                            f"risk~{actual_risk:.2f} | "
-                            f"portfolio risk~{_aggregate_risk(states):.2f}"
+                            f"{symbol}: {side.upper()} ARMED | "
+                            f"observe until {arm.decision_at.isoformat()} | "
+                            f"deadline {arm.deadline_at.isoformat()}"
                         )
+
+                # Resolve t+60s flow decisions even after the short candle-evaluation
+                # window has closed. Missing/gapped WebSocket coverage fails closed.
+                _process_ready_armed_signals(
+                    armed,
+                    contexts=primary_contexts,
+                    states=states,
+                    journal=journal,
+                    collector=collector,
+                    config_sha256=config_sha256,
+                    global_fail_closed=global_fail_closed,
+                )
 
                 any_pending = any(
                     st.get("entry_pending") for st in states.values() if st.get("known")
@@ -778,7 +1004,11 @@ def main() -> None:
                         )
                 else:
                     sleep_for = max(0.5, _seconds_until_next_candle_check())
-                    print(f"Portfolio flat; next evaluation in ~{sleep_for:.0f}s")
+                    if not armed:
+                        print(f"Portfolio flat; next evaluation in ~{sleep_for:.0f}s")
+                armed_wait = _seconds_until_armed_action(armed)
+                if armed_wait is not None:
+                    sleep_for = min(sleep_for, armed_wait)
                 time.sleep(sleep_for)
 
             except ExecutionError as exc:
@@ -790,6 +1020,8 @@ def main() -> None:
 
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
+    finally:
+        collector.stop()
 
 
 if __name__ == "__main__":
