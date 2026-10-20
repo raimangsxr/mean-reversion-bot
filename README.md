@@ -97,3 +97,12 @@ find state -maxdepth 1 -type f ! -name '.gitkeep' -delete
 ```
 
 If historical order-flow research outputs exist under `state/orderflow/`, they are not used by the live collector. The compact `aggtrades/` archive cache may be kept for reproducibility or removed independently.
+
+## Kubernetes
+
+Plain Kubernetes manifests (no Kustomize/Helm) live in `deploy/k8s/`.
+Deployment instructions are in `deploy/k8s/README.md`; the normal entry point is:
+
+```bash
+./deploy/k8s/deploy.sh
+```

@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mean-reversion-bot
+  namespace: mean-reversion-bot
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mean-reversion-bot
+  policyTypes:
+    - Ingress
+    - Egress
+  # The bot exposes no inbound service.
+  ingress: []
+  egress:
+    # DNS. Kept namespace-agnostic because DNS labels differ by distribution.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Binance REST/WebSocket and public market-data replay use HTTPS/WSS.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443

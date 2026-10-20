@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mean-reversion-bot-config
+  namespace: mean-reversion-bot
+data:
+  # Set this ONCE before the first forward deployment and never move it later.
+  V12_START_UTC: "SET_ME_BEFORE_FIRST_DEPLOYMENT"
+
+  USE_TESTNET: "True"
+  FORWARD_EXPERIMENT_ID: "v12"
+  FORWARD_ONLY_DEMO: "True"
+  BUILD_SHA: ""
+
+  TIMEFRAME: "1h"
+  LOOKBACK_WINDOW: "20"
+  Z_THRESHOLD: "2.2"
+  SHOCK1H_THRESHOLD: "2.175"
+  RETURN_SHOCK_VOL_WINDOW: "100"
+  ENTRY_MODE: "confirmed"
+  REGIME_MODE: "1h_sma200_4h_ema200"
+  REGIME_TIMEFRAME: "4h"
+  REGIME_EMA_WINDOW: "200"
+  REGIME_SLOPE_LOOKBACK: "6"
+  ATR_MULTIPLIER: "1.5"
+
+  MARGIN_MODE: "isolated"
+  LEVERAGE: "2"
+  TRIGGER_PRICE_TYPE: "MARK_PRICE"
+  ENTRY_EXECUTION_MODE: "pullback_limit"
+  ENTRY_LIMIT_OFFSET_BPS: "3.0"
+  # TOTAL entry deadline from t0. The first 60s are consumed by the frozen
+  # order-flow observation window.
+  ENTRY_LIMIT_WAIT_SECONDS: "420"
+  ENTRY_FALLBACK_CAP_BPS: "5.0"
+  ENTRY_PENDING_POLL_SECONDS: "10"
+  ENTRY_FALLBACK_MAX_LATENESS_SECONDS: "60"
+  EXIT_MODE: "fixed_rr"
+  RISK_REWARD_RATIO: "1.8"
+  TAKE_PROFIT_ORDER_MODE: "maker_limit"
+
+  INITIAL_CAPITAL: "10000"
+  CASH_BUFFER_PCT: "0.05"
+  STATE_FILE: "state/bot_state.json"
+  EXECUTION_JOURNAL_FILE: "state/execution_journal.jsonl"
+  FORWARD_JOURNAL_FILE: "state/forward.jsonl"
+  CANDLE_CLOSE_DELAY_SECONDS: "2"
+  SIGNAL_MAX_AGE_SECONDS: "60"
+  ERROR_RETRY_SECONDS: "10"
+  POSITION_POLL_SECONDS: "30"
+
+  # Used by forward_report.py. These are replay/cache settings, not tunable
+  # live order-flow gate parameters.
+  BACKTEST_START: "2020-01-01T00:00:00Z"
+  BACKTEST_TAKER_FEE: "0.0005"
+  BACKTEST_MAKER_FEE: "0.0002"
+  BACKTEST_MARKET_SLIPPAGE_BPS: "1,2,3,5"
+  BACKTEST_PRIMARY_SLIPPAGE_BPS: "2"
+  BACKTEST_TP_CROSS_TICKS: "1"
+  BACKTEST_REQUIRE_FUNDING: "True"
+  BACKTEST_FUNDING_CACHE_DIR: "state/funding"
+  BACKTEST_MINUTE_CACHE_DIR: "state/minute"
+  BACKTEST_HISTORY_CACHE_DIR: "state/history"
+  BACKTEST_MAX_PORTFOLIO_RISK_PCT: "0.015"
+  BACKTEST_MAX_CONCURRENT_POSITIONS: "3"
+  FUNDING_MAX_GAP_HOURS: "12"

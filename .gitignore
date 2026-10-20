@@ -12,3 +12,6 @@ build/
 *.egg-info/
 state/*
 !state/.gitkeep
+
+# Kubernetes local secrets
+deploy/k8s/secret.yaml
